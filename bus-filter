@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# bus-filter <handle> — the listener's filter stage.
+#
+# Reads bus.log lines on stdin; prints only the lines that (a) tag @<handle> or
+# @all in the ADDRESS field (before the ' :: ' delimiter, so @mentions inside a
+# message body never match) and (b) are NOT the handle's own sends (no self-echo).
+# One awk process, line-buffered — this is the stable listener (a two-stage
+# tail|grep|grep pipeline was dying with exit 144; a single awk stage is not).
+#
+# Usage (inside a Monitor):  tail -F -n 0 bus.log | /path/to/bus-filter <handle>
+set -uo pipefail
+h="$(printf '%s' "${1:?usage: bus-filter <handle>}" | tr '[:upper:]' '[:lower:]')"
+exec awk -v h="$h" -F' :: ' '
+  { a = tolower($1) }                                              # $1 = address field (before " :: ")
+  a !~ ("^\\[" h " ") && a ~ ("@(" h "|all)([^0-9a-z_]|$)") { print; fflush() }
+'

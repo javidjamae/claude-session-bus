@@ -11,6 +11,7 @@ BUS_DIR="${SESSION_BUS_DIR:-$HOME/.claude/session-bus}"
 LOG="$BUS_DIR/bus.log"
 ROSTER="$BUS_DIR/roster"
 mkdir -p "$BUS_DIR"; : >>"$LOG"; : >>"$ROSTER"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 now() { date +%H:%M; }
 
@@ -19,9 +20,7 @@ now() { date +%H:%M; }
 #     so an @mention inside a message body never triggers a wake.
 #  2. Drop the session's OWN messages ('[<handle> …'), so you never wake on self-echo.
 listen_cmd() {
-  local h="$1"
-  local match="^\\[[^]]+\\][^:]*@(${h}|all)([^[:alnum:]_]|\$)"
-  printf "tail -F -n 0 %s | grep --line-buffered -iE '%s' | grep -v --line-buffered -iE '^\\[%s '\n" "$LOG" "$match" "$h"
+  printf "tail -F -n 0 %s | %s/bus-filter %s\n" "$LOG" "$SELF_DIR" "$1"
 }
 
 roster_drop() { grep -v -iE "^$1\\|" "$ROSTER" >"$ROSTER.tmp" 2>/dev/null; mv "$ROSTER.tmp" "$ROSTER" 2>/dev/null; return 0; }
