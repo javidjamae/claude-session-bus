@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# bus — a tiny local coordination channel for Claude Code sessions.
+#
+# One shared append-only log + @mention addressing. Each session's listener
+# greps the log for its own @handle, so a session is only ever woken when it is
+# tagged — untagged traffic costs zero. Any session can read the full log for
+# context. See SKILL.md. No network, no daemon, no dependencies beyond coreutils.
+set -uo pipefail
+
+BUS_DIR="${SESSION_BUS_DIR:-$HOME/.claude/session-bus}"
+LOG="$BUS_DIR/bus.log"
+ROSTER="$BUS_DIR/roster"
+mkdir -p "$BUS_DIR"; : >>"$LOG"; : >>"$ROSTER"
+
+now() { date +%H:%M; }
+
+# Print the exact Monitor listen command for a handle: only lines tagging
+# @<handle> or @all wake the session (word-boundary so @bob != @bobby).
+listen_cmd() {
+  printf "tail -F -n 0 %s | grep --line-buffered -iE '@(%s|all)([^[:alnum:]_]|\$)'\n" "$LOG" "$1"
+}
+
+roster_drop() { grep -v -iE "^$1\\|" "$ROSTER" >"$ROSTER.tmp" 2>/dev/null; mv "$ROSTER.tmp" "$ROSTER" 2>/dev/null; return 0; }
+
+cmd="${1:-}"; shift 2>/dev/null || true
+case "$cmd" in
+  join)
+    h="${1:?usage: bus join <handle>}"
+    roster_drop "$h"
+    printf '%s|%s|%s\n' "$h" "$PWD" "$(date '+%Y-%m-%d %H:%M')" >>"$ROSTER"
+    printf '[%s %s] online (%s)\n' "$h" "$(now)" "$PWD" >>"$LOG"   # unmentioned: context only, wakes no one
+    echo "joined as '$h'. Arm your listener with this Monitor command (persistent):"
+    listen_cmd "$h"
+    ;;
+  listen-cmd)
+    listen_cmd "${1:?usage: bus listen-cmd <handle>}"
+    ;;
+  send)
+    from="${1:?usage: bus send <from> @to [@to2...] message}"; shift
+    tos=""
+    while [ $# -gt 0 ]; do case "$1" in @*) tos="$tos $1"; shift;; *) break;; esac; done
+    [ -n "$tos" ] || { echo "error: no @recipient (e.g. bus send alice @bob \"hi\")" >&2; exit 1; }
+    msg="$*"
+    [ -n "$msg" ] || { echo "error: empty message" >&2; exit 1; }
+    printf '[%s %s]%s %s\n' "$from" "$(now)" "$tos" "$msg" >>"$LOG"
+    echo "sent to$tos"
+    ;;
+  who)
+    if [ -s "$ROSTER" ]; then awk -F'|' '{printf "  @%-8s %s (joined %s)\n",$1,$2,$3}' "$ROSTER"; else echo "(nobody registered)"; fi
+    ;;
+  catchup)
+    h="${1:?usage: bus catchup <handle>}"
+    grep -iE "@($h|all)([^[:alnum:]_]|$)" "$LOG" 2>/dev/null | tail -20
+    ;;
+  log)
+    tail -n "${1:-80}" "$LOG"
+    ;;
+  leave)
+    h="${1:?usage: bus leave <handle>}"
+    roster_drop "$h"
+    printf '[%s %s] offline\n' "$h" "$(now)" >>"$LOG"
+    echo "left."
+    ;;
+  *)
+    cat >&2 <<'EOF'
+bus — local coordination for Claude Code sessions
+  bus join <handle>              register + print your Monitor listen command
+  bus send <from> @to [..] msg   post a message tagging recipient(s); @all = broadcast
+  bus who                        list registered handles
+  bus catchup <handle>           recent messages that tagged you
+  bus log [N]                    tail the shared log for full context (default 80)
+  bus leave <handle>             deregister
+EOF
+    exit 1
+    ;;
+esac
