@@ -14,10 +14,14 @@ mkdir -p "$BUS_DIR"; : >>"$LOG"; : >>"$ROSTER"
 
 now() { date +%H:%M; }
 
-# Print the exact Monitor listen command for a handle: only lines tagging
-# @<handle> or @all wake the session (word-boundary so @bob != @bobby).
+# Print the exact Monitor listen command for a handle. Two guards prevent false wakes:
+#  1. Match @<handle>/@all only in the ADDRESS field (before the ' :: ' delimiter),
+#     so an @mention inside a message body never triggers a wake.
+#  2. Drop the session's OWN messages ('[<handle> …'), so you never wake on self-echo.
 listen_cmd() {
-  printf "tail -F -n 0 %s | grep --line-buffered -iE '@(%s|all)([^[:alnum:]_]|\$)'\n" "$LOG" "$1"
+  local h="$1"
+  local match="^\\[[^]]+\\][^:]*@(${h}|all)([^[:alnum:]_]|\$)"
+  printf "tail -F -n 0 %s | grep --line-buffered -iE '%s' | grep -v --line-buffered -iE '^\\[%s '\n" "$LOG" "$match" "$h"
 }
 
 roster_drop() { grep -v -iE "^$1\\|" "$ROSTER" >"$ROSTER.tmp" 2>/dev/null; mv "$ROSTER.tmp" "$ROSTER" 2>/dev/null; return 0; }
@@ -42,7 +46,7 @@ case "$cmd" in
     [ -n "$tos" ] || { echo "error: no @recipient (e.g. bus send alice @bob \"hi\")" >&2; exit 1; }
     msg="$*"
     [ -n "$msg" ] || { echo "error: empty message" >&2; exit 1; }
-    printf '[%s %s]%s %s\n' "$from" "$(now)" "$tos" "$msg" >>"$LOG"
+    printf '[%s %s]%s :: %s\n' "$from" "$(now)" "$tos" "$msg" >>"$LOG"   # ' :: ' delimits address field from body
     echo "sent to$tos"
     ;;
   who)
@@ -50,7 +54,7 @@ case "$cmd" in
     ;;
   catchup)
     h="${1:?usage: bus catchup <handle>}"
-    grep -iE "@($h|all)([^[:alnum:]_]|$)" "$LOG" 2>/dev/null | tail -20
+    grep -iE "^\[[^]]+\][^:]*@($h|all)([^[:alnum:]_]|$)" "$LOG" 2>/dev/null | grep -v -iE "^\[$h " | tail -20
     ;;
   log)
     tail -n "${1:-80}" "$LOG"
