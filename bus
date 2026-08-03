@@ -13,7 +13,16 @@ ROSTER="$BUS_DIR/roster"
 mkdir -p "$BUS_DIR"; : >>"$LOG"; : >>"$ROSTER"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
-now() { date +%H:%M; }
+# Timestamp for log lines. Dated so messages are unambiguous across days.
+# Format: 'MM-DD HH:MM' (e.g. 08-03 00:51). bus-filter matches on @handle and the
+# leading '[<handle> ' self-echo guard — never on the timestamp — so this is safe.
+now() { date '+%m-%d %H:%M'; }
+
+# now() minus N hours, as 'MM-DD HH:MM' (BSD date, GNU date fallback). Used as a
+# lexical cutoff — 'MM-DD HH:MM' sorts correctly within a calendar year.
+now_minus_hours() {
+  date -v-"$1"H '+%m-%d %H:%M' 2>/dev/null || date -d "-$1 hours" '+%m-%d %H:%M' 2>/dev/null
+}
 
 # Print the exact Monitor listen command for a handle. Two guards prevent false wakes:
 #  1. Match @<handle>/@all only in the ADDRESS field (before the ' :: ' delimiter),
@@ -49,11 +58,59 @@ case "$cmd" in
     echo "sent to$tos"
     ;;
   who)
-    if [ -s "$ROSTER" ]; then awk -F'|' '{printf "  @%-8s %s (joined %s)\n",$1,$2,$3}' "$ROSTER"; else echo "(nobody registered)"; fi
+    if [ ! -s "$ROSTER" ]; then echo "(nobody registered)"; exit 0; fi
+    # Liveness is best-effort: there is no heartbeat, so we infer it from each
+    # handle's LAST activity in the log. Older than the stale window => 'stale?'
+    # (likely ended without 'bus leave', or just idle). Undated legacy lines can't
+    # be judged and are shown without a flag.
+    stale_hours=6
+    stale_cut="$(now_minus_hours "$stale_hours")"
+    while IFS='|' read -r hh pwd joined; do
+      [ -n "$hh" ] || continue
+      last="$(grep -iE "^\[$hh " "$LOG" 2>/dev/null | tail -1)"
+      seen=""; flag=""
+      if [ -n "$last" ]; then
+        # extract 'MM-DD HH:MM' from '[handle MM-DD HH:MM] ...'
+        seen="$(printf '%s' "$last" | sed -n 's/^\[[^ ]* \([0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]\)\].*/\1/p')"
+      fi
+      if [ -n "$seen" ]; then
+        if [ -n "$stale_cut" ] && [ "$seen" \< "$stale_cut" ]; then flag=" — stale?"; fi
+        printf "  @%-10s %s (joined %s, last seen %s%s)\n" "$hh" "$pwd" "$joined" "$seen" "$flag"
+      elif [ -n "$last" ]; then
+        # has log activity but only in the pre-dated-stamp format => hasn't spoken
+        # since the upgrade. Can't time it, but that itself is a staleness signal.
+        printf "  @%-10s %s (joined %s, last seen before dated-stamp upgrade — stale?)\n" "$hh" "$pwd" "$joined"
+      else
+        printf "  @%-10s %s (joined %s, no activity logged — stale?)\n" "$hh" "$pwd" "$joined"
+      fi
+    done < "$ROSTER"
+    printf "  (liveness is best-effort — 'last seen' = last bus activity; a session may be idle-but-listening, or ended without 'bus leave')\n"
     ;;
   catchup)
-    h="${1:?usage: bus catchup <handle>}"
-    grep -iE "^\[[^]]+\][^:]*@($h|all)([^[:alnum:]_]|$)" "$LOG" 2>/dev/null | grep -v -iE "^\[$h " | tail -20
+    h="${1:?usage: bus catchup <handle> [hours]}"
+    hours="${2:-12}"
+    cut="$(now_minus_hours "$hours")"
+    # Filter mentions of @h/@all (not self), then keep only lines newer than the
+    # cutoff. Timestamp is fields 2 (MM-DD) + 3 (HH:MM]) of the '[' address token;
+    # lexical compare of 'MM-DD HH:MM' is correct within a year. Undated legacy
+    # lines (pre-dated-stamp) are dropped when a window applies — their recency
+    # cannot be proven, and keeping them reproduces the old "re-dump" noise.
+    # They remain visible via 'bus log'. Self-heals once sessions emit dated lines.
+    awk -v h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')" -v cut="$cut" -F' :: ' '
+      { a = tolower($1) }
+      a ~ ("^\\[" h " ") { next }                              # drop self
+      a !~ ("@(" h "|all)([^0-9a-z_]|$)") { next }             # must tag h/all
+      {
+        split($1, p, " ")                                      # p[2]=MM-DD p[3]=HH:MM]
+        if (p[2] ~ /^[0-9][0-9]-[0-9][0-9]$/) {
+          ts = p[2] " " substr(p[3], 1, 5)
+          if (cut != "" && ts < cut) next                      # dated + older than window: drop
+        } else if (cut != "") {
+          next                                                 # undated (pre-dated-stamp): cannot prove recency, drop
+        }
+        print
+      }
+    ' "$LOG" 2>/dev/null | tail -40
     ;;
   log)
     tail -n "${1:-80}" "$LOG"
@@ -70,7 +127,7 @@ bus — local coordination for Claude Code sessions
   bus join <handle>              register + print your Monitor listen command
   bus send <from> @to [..] msg   post a message tagging recipient(s); @all = broadcast
   bus who                        list registered handles
-  bus catchup <handle>           recent messages that tagged you
+  bus catchup <handle> [hours]   messages that tagged you in the last N hours (default 12)
   bus log [N]                    tail the shared log for full context (default 80)
   bus leave <handle>             deregister
 EOF

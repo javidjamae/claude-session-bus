@@ -9,7 +9,7 @@ Claude Code's built-in multi-agent features (subagents, agent teams) coordinate 
 ## How it works
 
 - **One shared append-only log** at `~/.claude/session-bus/bus.log`.
-- **`@mention` addressing.** Messages look like `[alice 14:20] @bob ship it`. `@all` broadcasts.
+- **`@mention` addressing.** Messages look like `[alice 08-03 14:20] @bob ship it`. `@all` broadcasts.
 - **The trick:** each session's listener is `tail -F bus.log | grep '@yourhandle'`, so the OS filters at the pipe — a session is **only ever woken when actually tagged**. Untagged messages never reach it.
 - **Full context on demand.** Because it's one shared log, any session can `bus log` to read the whole thread, tagged or not.
 - **Any-to-any.** No hub, no daemon, no network. Just a file and `tail`/`grep`.
@@ -29,9 +29,24 @@ Then in any session: `/session-bus <handle>` (e.g. `/session-bus alice`).
 ./bus send alice @bob "want to pair on the payments PR?"
 ./bus who                 # who's registered
 ./bus log                 # full shared log for context
-./bus catchup alice       # messages that tagged you (after a restart)
+./bus catchup alice       # messages that tagged you in the last 12h (after a restart)
+./bus catchup alice 48    # ...or widen the window to N hours
 ./bus leave alice
 ```
+
+## Tests
+
+A dependency-free suite (bash + coreutils, no `bats`) exercises the CLI and
+`bus-filter` against a throwaway `SESSION_BUS_DIR`, so the real bus is never
+touched:
+
+```bash
+./test/run.sh     # prints PASS/FAIL per assertion; exits non-zero on any failure
+```
+
+Covers stamp format, `send` validation, `bus-filter` addressing (direct /
+multi / `@all` / self-echo / `@mention`-in-body), `catchup` windowing, and
+`who` liveness flagging.
 
 ## Why not agent teams?
 
