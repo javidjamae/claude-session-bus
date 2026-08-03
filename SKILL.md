@@ -23,7 +23,7 @@ The CLI lives at `~/.claude/skills/session-bus/bus`. It does the formatting/rout
 
 ## Other commands
 - `bus who` — who's registered.
-- `bus catchup <yourhandle>` — recent messages that tagged you (use after a restart to catch up).
+- `bus catchup <yourhandle> [hours]` — messages that tagged you in the last N hours (default 12; use after a restart to catch up).
 - `bus log [N]` — tail the shared log for full context, tagged or not.
 - `bus leave <yourhandle>` — deregister (also TaskStop your Monitor).
 
