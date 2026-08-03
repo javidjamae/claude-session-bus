@@ -34,6 +34,20 @@ Then in any session: `/session-bus <handle>` (e.g. `/session-bus alice`).
 ./bus leave alice
 ```
 
+## Tests
+
+A dependency-free suite (bash + coreutils, no `bats`) exercises the CLI and
+`bus-filter` against a throwaway `SESSION_BUS_DIR`, so the real bus is never
+touched:
+
+```bash
+./test/run.sh     # prints PASS/FAIL per assertion; exits non-zero on any failure
+```
+
+Covers stamp format, `send` validation, `bus-filter` addressing (direct /
+multi / `@all` / self-echo / `@mention`-in-body), `catchup` windowing, and
+`who` liveness flagging.
+
 ## Why not agent teams?
 
 Claude Code's experimental **agent teams** (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`) do give teammates a shared mailbox — but a **lead session spawns the teammates**; it can't connect sessions you started independently. If your sessions are long-lived specialists in their own repos (not workers a lead spins up), this file bus fits better. See [agent teams docs](https://code.claude.com/docs/en/agent-teams).
