@@ -34,15 +34,46 @@ listen_cmd() {
 
 roster_drop() { grep -v -iE "^$1\\|" "$ROSTER" >"$ROSTER.tmp" 2>/dev/null; mv "$ROSTER.tmp" "$ROSTER" 2>/dev/null; return 0; }
 
+# Roster line format: handle|cwd|joined|session_id
+# Field 4 (Claude Code session id, from $CLAUDE_CODE_SESSION_ID at join time) is
+# what the SessionEnd hook matches on, so auto-leave removes exactly the ending
+# session's entry — several sessions can share a cwd. Legacy 3-field lines simply
+# have an empty field 4 and are never auto-left.
+handles_by_session() { awk -F'|' -v s="$1" '$4 != "" && $4 == s { print $1 }' "$ROSTER" 2>/dev/null; }
+handles_by_cwd()     { awk -F'|' -v c="$1" '$2 == c { print $1 }' "$ROSTER" 2>/dev/null; }
+
+# Coarse mutex around roster read-modify-write. The SessionEnd hook makes
+# concurrent mutations real (two sessions can end at the same instant), and
+# rewriting the file unguarded would drop entries. mkdir is atomic everywhere;
+# a lock held longer than ~3s is assumed stale and broken.
+LOCKDIR="$BUS_DIR/.roster.lock"
+unlock() { rmdir "$LOCKDIR" 2>/dev/null; return 0; }
+lock() {
+  i=0
+  while ! mkdir "$LOCKDIR" 2>/dev/null; do
+    i=$((i+1))
+    if [ "$i" -ge 60 ]; then rmdir "$LOCKDIR" 2>/dev/null; mkdir "$LOCKDIR" 2>/dev/null; break; fi
+    sleep 0.05
+  done
+  trap unlock EXIT
+}
+
+# Deregister one handle: drop from roster, note it in the log.
+do_leave() { roster_drop "$1"; printf '[%s %s] offline\n' "$1" "$(now)" >>"$LOG"; }
+
 cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
   join)
     h="${1:?usage: bus join <handle>}"
+    sid="${CLAUDE_CODE_SESSION_ID:-}"   # exported into every Bash tool call by Claude Code
+    lock
     roster_drop "$h"
-    printf '%s|%s|%s\n' "$h" "$PWD" "$(date '+%Y-%m-%d %H:%M')" >>"$ROSTER"
+    printf '%s|%s|%s|%s\n' "$h" "$PWD" "$(date '+%Y-%m-%d %H:%M')" "$sid" >>"$ROSTER"
     printf '[%s %s] online (%s)\n' "$h" "$(now)" "$PWD" >>"$LOG"   # unmentioned: context only, wakes no one
+    unlock
     echo "joined as '$h'. Arm your listener with this Monitor command (persistent):"
     listen_cmd "$h"
+    [ -n "$sid" ] || echo "note: CLAUDE_CODE_SESSION_ID is unset, so auto-leave on session end can't fire for '$h' — run 'bus leave $h' yourself." >&2
     ;;
   listen-cmd)
     listen_cmd "${1:?usage: bus listen-cmd <handle>}"
@@ -65,7 +96,7 @@ case "$cmd" in
     # be judged and are shown without a flag.
     stale_hours=6
     stale_cut="$(now_minus_hours "$stale_hours")"
-    while IFS='|' read -r hh pwd joined; do
+    while IFS='|' read -r hh pwd joined sid; do
       [ -n "$hh" ] || continue
       last="$(grep -iE "^\[$hh " "$LOG" 2>/dev/null | tail -1)"
       seen=""; flag=""
@@ -116,10 +147,39 @@ case "$cmd" in
     tail -n "${1:-80}" "$LOG"
     ;;
   leave)
-    h="${1:?usage: bus leave <handle>}"
-    roster_drop "$h"
-    printf '[%s %s] offline\n' "$h" "$(now)" >>"$LOG"
-    echo "left."
+    case "${1:-}" in
+      # Used by the SessionEnd hook: deregister whoever this session registered as.
+      # Silent no-op (rc 0) when the session never joined — the hook fires for every
+      # Claude Code session on the machine, bus user or not.
+      --by-session)
+        sid="${2:?usage: bus leave --by-session <session-id>}"
+        lock
+        hs="$(handles_by_session "$sid")"
+        [ -n "$hs" ] || { echo "no bus registration for session $sid"; exit 0; }
+        for h in $hs; do do_leave "$h"; echo "left: @$h"; done
+        ;;
+      # Fallback for when no session id is available. Ambiguous by design when
+      # several handles share a cwd, so it refuses rather than guessing.
+      --by-cwd)
+        force=""; [ "${2:-}" = "--force" ] && { force=1; shift; }
+        p="${2:?usage: bus leave --by-cwd [--force] <path>}"
+        lock
+        hs="$(handles_by_cwd "$p")"
+        n="$(printf '%s' "$hs" | grep -c '[^[:space:]]')"
+        [ "$n" -gt 0 ] || { echo "no bus registration for $p"; exit 0; }
+        if [ "$n" -gt 1 ] && [ -z "$force" ]; then
+          echo "error: $n handles registered at $p ($(echo $hs | tr '\n' ' ')) — pass a handle explicitly, or --force to drop all" >&2
+          exit 1
+        fi
+        for h in $hs; do do_leave "$h"; echo "left: @$h"; done
+        ;;
+      *)
+        h="${1:?usage: bus leave <handle> | --by-session <id> | --by-cwd [--force] <path>}"
+        lock
+        do_leave "$h"
+        echo "left."
+        ;;
+    esac
     ;;
   *)
     cat >&2 <<'EOF'
@@ -130,6 +190,9 @@ bus — local coordination for Claude Code sessions
   bus catchup <handle> [hours]   messages that tagged you in the last N hours (default 12)
   bus log [N]                    tail the shared log for full context (default 80)
   bus leave <handle>             deregister
+  bus leave --by-session <id>    deregister whatever that Claude session joined as (used by the SessionEnd hook)
+  bus leave --by-cwd [--force] <path>
+                                 deregister by working directory (refuses if >1 handle shares it)
 EOF
     exit 1
     ;;

@@ -13,15 +13,45 @@ Claude Code's built-in multi-agent features (subagents, agent teams) coordinate 
 - **The trick:** each session's listener is `tail -F bus.log | grep '@yourhandle'`, so the OS filters at the pipe — a session is **only ever woken when actually tagged**. Untagged messages never reach it.
 - **Full context on demand.** Because it's one shared log, any session can `bus log` to read the whole thread, tagged or not.
 - **Any-to-any.** No hub, no daemon, no network. Just a file and `tail`/`grep`.
+- **Self-cleaning roster.** A `SessionEnd` hook deregisters a session when it ends, so `bus who` shows who's actually there.
 
 ## Install
 
 **As a Claude Code skill:**
 ```bash
 git clone https://github.com/javidjamae/claude-session-bus.git
-cd claude-session-bus && ./install.sh   # symlinks the skill into ~/.claude/skills/session-bus
+cd claude-session-bus && ./install.sh   # symlinks the skill + registers the auto-leave hook
 ```
 Then in any session: `/session-bus <handle>` (e.g. `/session-bus alice`).
+
+`install.sh` symlinks the repo into `~/.claude/skills/session-bus` and merges a
+`SessionEnd` hook into `~/.claude/settings.json`. The merge preserves every hook
+already there and replaces our own entry instead of stacking duplicates, so
+re-running is safe. It backs the file up to `settings.json.bak` first, and uses
+`jq` or `python3` — whichever is present — rather than editing JSON by hand.
+
+```bash
+./install.sh --no-hook     # skill only; never touches settings.json
+./install.sh --uninstall   # remove our hook (leaving others intact) + the symlink
+```
+
+## Auto-leave on session end
+
+Sessions used to linger in `bus who` forever, because nothing told the bus they
+were gone. Now `bus join` records the session's `$CLAUDE_CODE_SESSION_ID` next to
+the handle, and the `SessionEnd` hook runs `bus leave --by-session <id>` as the
+session shuts down.
+
+Keying on the session id — not the working directory — is what makes it safe:
+several sessions can be open in one repo (`@apb`, `@apb1`, `@apb2`), and only the
+one that actually ended gets deregistered. When no session id is available the
+hook falls back to `--by-cwd`, which refuses to act if that directory is
+ambiguous rather than deregistering the wrong session.
+
+**It's best-effort.** `SessionEnd` doesn't fire on `SIGKILL`, a closed terminal
+window, or a crash, so a session can still leave a stale entry behind. That's why
+`bus who` keeps its `stale?` flags — they're the backstop, not redundant. Sessions
+that joined before this change (no recorded session id) are never auto-left.
 
 **Or use the CLI directly** (it's just `bus`):
 ```bash
@@ -31,7 +61,7 @@ Then in any session: `/session-bus <handle>` (e.g. `/session-bus alice`).
 ./bus log                 # full shared log for context
 ./bus catchup alice       # messages that tagged you in the last 12h (after a restart)
 ./bus catchup alice 48    # ...or widen the window to N hours
-./bus leave alice
+./bus leave alice         # (the SessionEnd hook does this for you automatically)
 ```
 
 ## Tests
@@ -45,8 +75,11 @@ touched:
 ```
 
 Covers stamp format, `send` validation, `bus-filter` addressing (direct /
-multi / `@all` / self-echo / `@mention`-in-body), `catchup` windowing, and
-`who` liveness flagging.
+multi / `@all` / self-echo / `@mention`-in-body), `catchup` windowing, `who`
+liveness flagging, session-id-keyed auto-leave (including the sibling-session and
+ambiguous-cwd cases), the `SessionEnd` hook, and the `install.sh` settings.json
+merge — which runs against a throwaway `$HOME`, so your real settings are never
+touched either.
 
 ## Why not agent teams?
 
