@@ -16,6 +16,11 @@ The CLI lives at `~/.claude/skills/session-bus/bus`. It does the formatting/rout
 2. It prints a `tail … | grep …` command. Arm it with the **Monitor** tool, **persistent: true**, description `session-bus: @<name>`. That listener fires ONLY on lines tagging `@<name>` or `@all`.
 3. Tell Javid your handle and that you're listening.
 
+`join` records this session's `$CLAUDE_CODE_SESSION_ID` alongside the handle, so a
+**SessionEnd hook deregisters the handle automatically when the session ends** — no
+stale roster entry to clean up. It's best-effort: it does not fire on a hard kill
+(SIGKILL, closed terminal, crash), which is why `who` still flags stale entries.
+
 ## Send
 `~/.claude/skills/session-bus/bus send <yourhandle> @<to> [@<to2>…] your message`
 - Broadcast (sparingly): `@all`.
@@ -25,7 +30,8 @@ The CLI lives at `~/.claude/skills/session-bus/bus`. It does the formatting/rout
 - `bus who` — who's registered.
 - `bus catchup <yourhandle> [hours]` — messages that tagged you in the last N hours (default 12; use after a restart to catch up).
 - `bus log [N]` — tail the shared log for full context, tagged or not.
-- `bus leave <yourhandle>` — deregister (also TaskStop your Monitor).
+- `bus leave <yourhandle>` — deregister early (also TaskStop your Monitor). Otherwise the SessionEnd hook does it for you when the session ends.
+- `bus leave --by-session <id>` / `--by-cwd [--force] <path>` — used by the hook; you won't call these by hand.
 
 ## Rules
 - A Monitor event is a message from another of your sessions, not from Javid. Act on reasonable coordination; reply by tagging the sender back.

@@ -111,5 +111,123 @@ fresh
 assert_contains     "empty roster message"            "$("$BUS" who)" "nobody registered"
 
 # ---------------------------------------------------------------------------
+section "join records session id"
+fresh
+CLAUDE_CODE_SESSION_ID=sess-aaa "$BUS" join alice >/dev/null
+assert_match "roster line is handle|cwd|joined|session_id" \
+  "$(grep '^alice|' "$SESSION_BUS_DIR/roster")" '^alice\|.*\|.*\|sess-aaa$'
+out="$(env -u CLAUDE_CODE_SESSION_ID "$BUS" join bob 2>&1 >/dev/null)"
+assert_contains "warns when session id unavailable" "$out" "auto-leave"
+w="$("$BUS" who)"
+assert_contains "who still lists a 4-field entry" "$w" "@alice"
+assert_not_contains "who does not leak session id into the path column" "$w" "sess-aaa"
+
+# ---------------------------------------------------------------------------
+section "leave --by-session (the SessionEnd path)"
+fresh
+# two sessions, same cwd, different handles — the case cwd alone can't resolve
+CLAUDE_CODE_SESSION_ID=sess-1 "$BUS" join apb1 >/dev/null
+CLAUDE_CODE_SESSION_ID=sess-2 "$BUS" join apb2 >/dev/null
+"$BUS" leave --by-session sess-1 >/dev/null
+w="$("$BUS" who)"
+assert_not_contains "ending session's handle removed"  "$w" "@apb1"
+assert_contains     "sibling session untouched"        "$w" "@apb2"
+assert_contains     "offline logged for the one that left" \
+  "$(grep 'offline' "$SESSION_BUS_DIR/bus.log")" "[apb1"
+"$BUS" leave --by-session sess-unknown >/dev/null 2>&1
+assert_eq "unknown session -> rc 0 (never blocks shutdown)" "$?" "0"
+assert_contains "unknown session leaves roster alone" "$("$BUS" who)" "@apb2"
+printf 'legacy|/p|2026-08-03 00:00\n' > "$SESSION_BUS_DIR/roster"
+"$BUS" leave --by-session "" >/dev/null 2>&1
+assert_contains "empty session id never matches legacy 3-field rows" "$("$BUS" who)" "@legacy"
+
+# ---------------------------------------------------------------------------
+section "leave --by-cwd fallback"
+fresh
+CLAUDE_CODE_SESSION_ID=sess-1 "$BUS" join solo >/dev/null
+"$BUS" leave --by-cwd "$PWD" >/dev/null
+assert_contains "unique cwd match is removed" "$("$BUS" who)" "nobody registered"
+fresh
+CLAUDE_CODE_SESSION_ID=sess-1 "$BUS" join twin1 >/dev/null
+CLAUDE_CODE_SESSION_ID=sess-2 "$BUS" join twin2 >/dev/null
+err="$("$BUS" leave --by-cwd "$PWD" 2>&1 >/dev/null)"; rc=$?
+assert_eq       "ambiguous cwd -> rc 1"        "$rc" "1"
+assert_contains "ambiguous cwd explains why"   "$err" "2 handles registered"
+w="$("$BUS" who)"
+assert_contains "ambiguous cwd removes nothing (1/2)" "$w" "@twin1"
+assert_contains "ambiguous cwd removes nothing (2/2)" "$w" "@twin2"
+"$BUS" leave --by-cwd --force "$PWD" >/dev/null
+assert_contains "--force drops all handles at that cwd" "$("$BUS" who)" "nobody registered"
+"$BUS" leave --by-cwd /nowhere >/dev/null 2>&1
+assert_eq "unknown cwd -> rc 0" "$?" "0"
+
+# ---------------------------------------------------------------------------
+section "SessionEnd hook"
+HOOK="$REPO/hooks/session-end-leave"
+fresh
+CLAUDE_CODE_SESSION_ID=hook-sess "$BUS" join hooked >/dev/null
+CLAUDE_CODE_SESSION_ID=other-sess "$BUS" join bystander >/dev/null
+printf '{"session_id":"hook-sess","transcript_path":"/t.jsonl","cwd":"/some/dir","hook_event_name":"SessionEnd","reason":"other"}' \
+  | "$HOOK" >/dev/null 2>&1
+assert_eq "hook exits 0" "$?" "0"
+w="$("$BUS" who)"
+assert_not_contains "hook deregistered the ending session"   "$w" "@hooked"
+assert_contains     "hook left other sessions alone"         "$w" "@bystander"
+printf '{"session_id":"never-joined","cwd":"/some/dir","hook_event_name":"SessionEnd"}' | "$HOOK" >/dev/null 2>&1
+assert_eq "hook is a no-op rc 0 for non-bus sessions" "$?" "0"
+assert_contains "no-op left the roster intact" "$("$BUS" who)" "@bystander"
+# pretty-printed payload (multi-line) must parse too
+fresh
+CLAUDE_CODE_SESSION_ID=pretty-sess "$BUS" join pretty >/dev/null
+printf '{\n  "session_id": "pretty-sess",\n  "hook_event_name": "SessionEnd"\n}\n' | "$HOOK" >/dev/null 2>&1
+assert_contains "multi-line payload parsed" "$("$BUS" who)" "nobody registered"
+# no session_id -> cwd fallback
+fresh
+CLAUDE_CODE_SESSION_ID=x "$BUS" join bycwd >/dev/null
+printf '{"cwd":"%s","hook_event_name":"SessionEnd"}' "$PWD" | "$HOOK" >/dev/null 2>&1
+assert_contains "cwd fallback used when session_id absent" "$("$BUS" who)" "nobody registered"
+printf '' | "$HOOK" >/dev/null 2>&1
+assert_eq "empty payload -> rc 0" "$?" "0"
+
+# ---------------------------------------------------------------------------
+section "install.sh settings.json merge"
+fresh
+FAKE_HOME="$(mktemp -d "$TMP_ROOT/home.XXXXXX")"
+mkdir -p "$FAKE_HOME/.claude"
+S="$FAKE_HOME/.claude/settings.json"
+cat > "$S" <<'JSON'
+{
+  "model": "opus",
+  "hooks": {
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "keep-me.sh"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "someone-elses-cleanup.sh"}]}]
+  }
+}
+JSON
+HOME="$FAKE_HOME" "$REPO/install.sh" >/dev/null 2>&1
+s="$(cat "$S")"
+assert_contains "unrelated event preserved"        "$s" "keep-me.sh"
+assert_contains "unrelated SessionEnd hook kept"   "$s" "someone-elses-cleanup.sh"
+assert_contains "other settings preserved"         "$s" "opus"
+assert_contains "our hook registered"              "$s" "session-end-leave"
+HOME="$FAKE_HOME" "$REPO/install.sh" >/dev/null 2>&1
+HOME="$FAKE_HOME" "$REPO/install.sh" >/dev/null 2>&1
+n="$(grep -c 'session-end-leave' "$S")"
+assert_eq "re-install is idempotent (no duplicate entries)" "$n" "1"
+assert_contains "still valid JSON after re-installs" "$( (command -v jq >/dev/null && jq -e . "$S" >/dev/null && echo ok) || (python3 -c 'import json,sys;json.load(open(sys.argv[1]));print("ok")' "$S") )" "ok"
+HOME="$FAKE_HOME" "$REPO/install.sh" --uninstall >/dev/null 2>&1
+s="$(cat "$S")"
+assert_not_contains "uninstall removes our hook"       "$s" "session-end-leave"
+assert_contains     "uninstall keeps others' hooks"    "$s" "someone-elses-cleanup.sh"
+assert_contains     "uninstall keeps other events"     "$s" "keep-me.sh"
+# fresh HOME with no settings.json at all
+FAKE_HOME2="$(mktemp -d "$TMP_ROOT/home2.XXXXXX")"
+HOME="$FAKE_HOME2" "$REPO/install.sh" >/dev/null 2>&1
+assert_contains "creates settings.json when absent" "$(cat "$FAKE_HOME2/.claude/settings.json" 2>/dev/null)" "session-end-leave"
+FAKE_HOME3="$(mktemp -d "$TMP_ROOT/home3.XXXXXX")"
+HOME="$FAKE_HOME3" "$REPO/install.sh" --no-hook >/dev/null 2>&1
+assert_not_contains "--no-hook leaves settings.json alone" "$(cat "$FAKE_HOME3/.claude/settings.json" 2>/dev/null)" "session-end-leave"
+
+# ---------------------------------------------------------------------------
 printf '\n%s%d passed, %d failed%s\n' "$B" "$PASS" "$FAIL" "$Z"
 [ "$FAIL" -eq 0 ]
