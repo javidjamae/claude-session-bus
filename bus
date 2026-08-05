@@ -348,6 +348,31 @@ case "$cmd" in
     [ -f "$BLOBS/$key" ] || { echo "error: no such blob: $key" >&2; exit 1; }
     cat "$BLOBS/$key"
     ;;
+  whoami)
+    # "What am I on the bus?" — answered from the session's own identity rather
+    # than from the working directory, since several sessions can share a repo.
+    # Falls back to the owning process, then to the cwd, and says which it used
+    # so a guess never reads like a fact.
+    sid="${CLAUDE_CODE_SESSION_ID:-}"; cpid="$(claude_pid)"; hs=""; via=""
+    [ -n "$sid" ] && { hs="$(handles_by_session "$sid")"; [ -n "$hs" ] && via="session id"; }
+    if [ -z "$hs" ] && [ -n "$cpid" ]; then
+      hs="$(awk -F'|' -v p="$cpid" '$5 != "" && $5 == p { print $1 }' "$ROSTER" 2>/dev/null)"
+      [ -n "$hs" ] && via="owning process (pid $cpid)"
+    fi
+    if [ -z "$hs" ]; then
+      hs="$(handles_by_cwd "$PWD")"
+      [ -n "$hs" ] && via="working directory — a guess, since sessions can share a repo"
+    fi
+    if [ -z "$hs" ]; then
+      echo "not on the bus. Join with: bus join <handle>" >&2
+      exit 1
+    fi
+    for h in $hs; do
+      printf '@%s\n' "$h"
+      printf '  matched by %s\n' "$via"
+      printf '  listen:    %s\n' "$(listen_cmd "$h")"   # $() strips listen_cmd's own newline
+    done
+    ;;
   who)
     lock; reaped="$(prune_dead)"; unlock
     for h in $reaped; do echo "  (reaped @$h — its Claude Code process is gone)"; done
@@ -494,6 +519,7 @@ bus — local coordination for Claude Code sessions
                                  (multi-line/large payloads auto-store as a blob)
   bus put [file]                 store a payload (file or stdin); prints its blob key
   bus get <key>                  print a stored payload
+  bus whoami                     the handle THIS session is registered as
   bus who                        list registered handles (reaps dead ones first)
   bus prune [--force]            drop handles whose process is gone; sweep old blobs
                                  (--force also drops rows that recorded no pid)

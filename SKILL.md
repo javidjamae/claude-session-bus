@@ -4,10 +4,30 @@
 
 The CLI lives at `~/.claude/skills/session-bus/bus`. It does the formatting/routing so it can't be fat-fingered.
 
-**Usage:**
-- `/session-bus <name>` — join as `<name>` (short lowercase handle, e.g. `alice`, `bob`, `javid`, `arianna`).
-- `/session-bus` — join using a short slug derived from the current project dir.
-- `/session-bus leave` — deregister and stop your listener.
+**Usage — verb first:**
+
+| command | does |
+| --- | --- |
+| `/session-bus` | join, using a slug of the current project dir |
+| `/session-bus join [name]` | join as `name` (short lowercase, e.g. `alice`) |
+| `/session-bus whoami` | the handle THIS session is registered as |
+| `/session-bus who` | everyone currently registered |
+| `/session-bus send @bob <message>` | send a message |
+| `/session-bus catchup` | mentions you haven't been shown yet |
+| `/session-bus log [N]` | tail the shared log |
+| `/session-bus leave` | deregister and stop your listener |
+
+**How the argument is read.** These arguments are not parsed by any code — the
+text after `/session-bus` arrives as free text and you interpret it. Apply this
+rule so it stays predictable:
+
+1. If the first word is one of the verbs above (`join`, `whoami`, `who`, `send`,
+   `catchup`, `log`, `leave`, plus `prune`, `put`, `get`), it is that command.
+2. Otherwise treat the whole thing as a handle to join as — `/session-bus alice`
+   still means "join as alice".
+3. To claim a handle that collides with a verb, the user must say it explicitly:
+   `/session-bus join who`. Never guess between the two readings; if a bare word
+   is ambiguous in context, ask.
 
 ---
 
@@ -38,6 +58,7 @@ reaped — liveness is a process check, not a timeout.
   `key=$(bus put <file>)`, then reference `$key` in your message.
 
 ## Other commands
+- `bus whoami` — the handle this session is registered as (keyed on the session id, so a sibling session in the same repo is never mistaken for you). Use it when you've lost track of your own name.
 - `bus who` — who's registered (reaps handles whose process is gone first).
 - `bus prune` — just the reap, without the listing (also sweeps blobs >30d old).
 - `bus prune --force` — also drop rows that recorded no pid (live ones still spared). Use when you know those sessions are gone; `bus leave <handle>` drops a single row the same way.

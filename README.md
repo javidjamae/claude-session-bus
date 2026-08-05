@@ -139,6 +139,7 @@ reads later as though the process table had proven something.
 ```bash
 ./bus join alice          # registers + prints your Monitor listen command
 ./bus send alice @bob "want to pair on the payments PR?"
+./bus whoami              # the handle THIS session is registered as
 ./bus who                 # who's registered (reaps handles whose process is gone)
 ./bus prune               # just the reap (and a sweep of blobs older than 30d)
 ./bus prune --force       # ...also drop rows that recorded no pid to check
