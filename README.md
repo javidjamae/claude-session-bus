@@ -47,6 +47,42 @@ one that actually ended gets deregistered. When no session id is available the
 hook falls back to `--by-cwd`, which refuses to act if that directory is
 ambiguous rather than deregistering the wrong session.
 
+### One live session per handle
+
+A handle belongs to one running session at a time. `join` refuses a name that a
+live session already holds, and suggests the next free suffix:
+
+```bash
+./bus join apb
+# error: the handle @apb is taken — a live session holds it (pid 17542, /Users/me/code/autopilot-blog).
+#        Try @apb2 instead.
+```
+
+Sharing a name half-works, which is worse than not working: delivery ignores the
+roster (`bus-filter` matches the `@mention` in the log line), so **both** sessions
+wake on every message; they share one read cursor, so either can consume the
+other's `catchup`; and only the newcomer appears in `who`. Refusing is cheaper
+than explaining that.
+
+A restart under the same name is not a collision — the previous holder's row is
+already reaped by the time the check runs, so reclaiming your own handle stays
+silent. Neither is re-registering from the same session.
+
+Removal is session-keyed for the same reason. `bus leave <handle>` refuses when
+the row belongs to a different session, since that session is probably still
+listening and would be left receiving messages while invisible in `who`:
+
+```bash
+./bus leave mc            # error: @mc is registered to a different session (…), not this one.
+./bus leave --force mc    # deregister it anyway — how you reclaim a name
+```
+
+The check only applies when both sides identify themselves, so a row with no
+session id, or a call from a plain shell, stays freely removable for hand cleanup.
+`--by-cwd` — the hook's fallback when no session id is available — additionally
+keeps any row whose process is still alive, unless that process is the session
+currently ending.
+
 ### What `SessionEnd` actually covers
 
 Measured on macOS with Claude Code 2.1.220 (`test/`-style probe: seed a roster row
@@ -80,9 +116,24 @@ days is still listed as `process live`; a session killed ten seconds ago is gone
 An activity-based TTL would have gotten both of those backwards.
 
 Rows with no recorded pid — joined from a plain shell, where there's no Claude
-Code process to walk up to — are never reaped: not being able to prove a session
-is alive isn't proof that it's dead. Those fall back to the `stale?` heuristic in
+Code process to walk up to — are left alone by that automatic reap: not being
+able to prove a session is alive isn't proof that it's dead, and `prune` runs
+unbidden inside every `who` and `join`, so it must not silently deregister a
+session it can't assess. Those rows fall back to the `stale?` heuristic in
 `bus who`, which infers liveness from the handle's last activity in the log.
+
+Nothing stops you removing them, though — the caution is about what happens
+*without* being asked:
+
+```bash
+./bus leave vid          # drop one row, no evidence required
+./bus prune --force      # also drop every row that recorded no pid
+```
+
+`--force` still spares rows whose process is provably alive; it only removes the
+judgement call. The log records which is which — `reaped: session process gone`
+versus `reaped: no pid recorded, dropped by --force` — so a forced sweep never
+reads later as though the process table had proven something.
 
 **Or use the CLI directly** (it's just `bus`):
 ```bash
@@ -90,12 +141,14 @@ is alive isn't proof that it's dead. Those fall back to the `stale?` heuristic i
 ./bus send alice @bob "want to pair on the payments PR?"
 ./bus who                 # who's registered (reaps handles whose process is gone)
 ./bus prune               # just the reap (and a sweep of blobs older than 30d)
+./bus prune --force       # ...also drop rows that recorded no pid to check
 ./bus log                 # full shared log for context
 ./bus catchup alice       # every mention you haven't been shown yet (after a restart)
 ./bus catchup alice 48    # ...or override the cursor with a plain N-hour window
 ./bus put ./diff.patch    # store a payload, print its key
 ./bus get 20260805-120000-41337   # read a payload someone sent
 ./bus leave alice         # (the SessionEnd hook does this for you automatically)
+./bus leave --force alice # ...even if the row belongs to another session
 ```
 
 ## Catchup is a cursor, not a clock
@@ -158,7 +211,9 @@ and its window fallback, blob offload of multi-line and oversized payloads
 (`put`/`get` round-trip, preview line, path-as-key rejection), `who`
 liveness flagging, session-id-keyed auto-leave (including the sibling-session and
 ambiguous-cwd cases), `prune`'s pid reaper (dead pid, recycled pid, silent-but-live
-session, pid-less row), the `SessionEnd` hook, and the `install.sh` settings.json
+session, pid-less row), `prune --force`, handle ownership (a taken name refused
+with a suffix suggestion, a restart still reclaiming its own name, and removal
+refusing to evict another session unless forced), the `SessionEnd` hook, and the `install.sh` settings.json
 merge — which runs against a throwaway `$HOME`, so your real settings are never
 touched either.
 

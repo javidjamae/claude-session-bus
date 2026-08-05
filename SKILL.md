@@ -13,6 +13,9 @@ The CLI lives at `~/.claude/skills/session-bus/bus`. It does the formatting/rout
 
 ## Join
 1. Run: `~/.claude/skills/session-bus/bus join <name>` (uses the current project dir slug if no name).
+   If the name is held by a live session, `join` refuses and suggests a free one
+   (`@apb` taken → try `@apb2`). Take the suggestion; don't force it. Reclaiming
+   your own handle after a restart is not a collision and just works.
 2. It prints a `tail … | grep …` command. Arm it with the **Monitor** tool, **persistent: true**, description `session-bus: @<name>`. That listener fires ONLY on lines tagging `@<name>` or `@all`.
 3. Tell Javid your handle and that you're listening.
 
@@ -37,13 +40,14 @@ reaped — liveness is a process check, not a timeout.
 ## Other commands
 - `bus who` — who's registered (reaps handles whose process is gone first).
 - `bus prune` — just the reap, without the listing (also sweeps blobs >30d old).
+- `bus prune --force` — also drop rows that recorded no pid (live ones still spared). Use when you know those sessions are gone; `bus leave <handle>` drops a single row the same way.
 - `bus get <key>` — print a payload someone sent as a blob.
 - `bus put [file]` — store a payload (file or stdin); prints its key.
 - `bus catchup <yourhandle>` — every mention you have not been shown yet, exactly:
   it tracks a read cursor, so nothing is missed and nothing is re-dumped. Run it
   after a restart. Pass `[hours]` only to override it with a plain time window.
 - `bus log [N]` — tail the shared log for full context, tagged or not.
-- `bus leave <yourhandle>` — deregister early (also TaskStop your Monitor). Otherwise the SessionEnd hook does it for you when the session ends.
+- `bus leave <yourhandle>` — deregister early (also TaskStop your Monitor). Otherwise the SessionEnd hook does it for you when the session ends. It refuses to deregister a handle registered to a *different* session; `--force` overrides, which is how you reclaim a name.
 - `bus leave --by-session <id>` / `--by-cwd [--force] <path>` — used by the hook; you won't call these by hand.
 
 ## Rules

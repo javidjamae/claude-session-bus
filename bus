@@ -128,18 +128,26 @@ claude_pid() {
 # Rows with no pid are kept: absence of proof of death is not proof of death.
 # Caller must hold the lock.
 prune_dead() {
+  _force="${1:-}"
   command -v ps >/dev/null 2>&1 || return 0
   [ -s "$ROSTER" ] || return 0
   # Every variable here is _p-prefixed on purpose: this runs inside `join`, and a
   # plainly-named `read -r ... sid ...` silently overwrote the joining session's
   # own $sid — which wrote an empty session id to the roster and quietly disabled
   # auto-leave for that handle.
-  reaped=""
+  reaped=""; forced=""
   : >"$ROSTER.tmp"
   while IFS='|' read -r _ph _pcwd _pjoined _psid _ppid _pstart || [ -n "${_ph:-}" ]; do
     [ -n "${_ph:-}" ] || continue
     case "${_ppid:-}" in
-      ''|*[!0-9]*) ;;                                  # no/non-numeric pid: unjudgeable, keep
+      ''|*[!0-9]*)
+        # No pid to judge: a row from a plain-shell join, where there was no
+        # Claude Code process to walk up to. Kept by default because prune runs
+        # unbidden inside `who` and `join`, and an unrelated command must not
+        # silently deregister a session it cannot assess. `--force` is the
+        # caller saying they know these are gone.
+        [ -n "$_force" ] && { forced="$forced $_ph"; _ph=""; continue; }
+        ;;
       *)
         _pcur="$(proc_start "$_ppid")"
         if [ -z "$_pcur" ] || { [ -n "${_pstart:-}" ] && [ "$_pcur" != "$_pstart" ]; }; then
@@ -157,6 +165,12 @@ prune_dead() {
   # handle instead of the joining one).
   for _reap_h in $reaped; do
     printf '[%s %s] offline (reaped: session process gone)\n' "$_reap_h" "$(now)" >>"$LOG"
+    printf '%s\n' "$_reap_h"
+  done
+  # Logged distinctly: these were dropped on the caller's say-so, not because the
+  # process table proved anything. The log should never blur the two.
+  for _reap_h in $forced; do
+    printf '[%s %s] offline (reaped: no pid recorded, dropped by --force)\n' "$_reap_h" "$(now)" >>"$LOG"
     printf '%s\n' "$_reap_h"
   done
 }
@@ -185,6 +199,26 @@ do_leave() {
   roster_drop "$1"
   printf '[%s %s] offline\n' "$1" "$(now)" >>"$LOG"
   cursor_set "$1" "$(log_size)"
+}
+
+# --- ownership --------------------------------------------------------------
+# Registration is keyed on the session id; removal used to be keyed only on the
+# handle, and the two disagree the moment a handle changes hands. A session that
+# has been displaced (another session joined under its name) would otherwise
+# deregister the LIVE holder on its way out — the row is gone while that
+# session's listener keeps running, so it receives messages but is invisible in
+# `who`. These read a row's identity fields so removal can check ownership.
+
+row_field() { awk -F'|' -v hh="$1" -v n="$2" 'tolower($1)==tolower(hh) { print $n; exit }' "$ROSTER" 2>/dev/null; }
+
+# Is this row's recorded process still the one that registered it? A pid alone
+# isn't enough — pids get recycled, hence the start-time comparison.
+row_alive() {
+  _rp="$(row_field "$1" 5)"; _rs="$(row_field "$1" 6)"
+  case "${_rp:-}" in ''|*[!0-9]*) return 1;; esac
+  _rc="$(proc_start "$_rp")"
+  [ -n "$_rc" ] || return 1
+  [ -z "${_rs:-}" ] || [ "$_rc" = "$_rs" ]
 }
 
 # Time-windowed catchup: the fallback for handles with no cursor yet, and what
@@ -231,6 +265,24 @@ case "$cmd" in
       [ -n "$base" ] || base="session"
       h="$base"; n=1
       while grep -qiE "^$h\|" "$ROSTER" 2>/dev/null; do n=$((n+1)); h="$base$n"; done
+    fi
+    # One live session per handle. Two sessions sharing a name half-works and
+    # fails confusingly: both listeners wake on every @mention (delivery ignores
+    # the roster), they share one read cursor so either can eat the other's
+    # catchup, and only the newcomer appears in `who`. So a taken name is simply
+    # refused. Dead rows are already reaped above, so a restart under the same
+    # name never trips this — and re-registering from the same session is not a
+    # collision either.
+    if grep -qiE "^$h\|" "$ROSTER" 2>/dev/null && row_alive "$h"; then
+      owner_sid="$(row_field "$h" 4)"; owner_pid="$(row_field "$h" 5)"
+      if [ "${owner_sid:-}" != "${sid:-}" ] && [ "${owner_pid:-}" != "${cpid:-}" ]; then
+        unlock
+        # Suggest the next free suffix, so the answer to "taken" is a name, not a puzzle.
+        n=2; while grep -qiE "^$h$n\|" "$ROSTER" 2>/dev/null; do n=$((n+1)); done
+        echo "error: the handle @$h is taken — a live session holds it (pid $owner_pid, $(row_field "$h" 2))." >&2
+        echo "       Try @$h$n instead." >&2
+        exit 1
+      fi
     fi
     roster_drop "$h"
     printf '%s|%s|%s|%s|%s|%s\n' "$h" "$PWD" "$(date '+%Y-%m-%d %H:%M')" "$sid" "$cpid" "$cstart" >>"$ROSTER"
@@ -333,10 +385,13 @@ case "$cmd" in
     printf "  ('process live' is checked against the process table; 'last seen' rows predate that check and are only a guess)\n"
     ;;
   prune)
-    lock; reaped="$(prune_dead)"; unlock
+    # --force also drops rows carrying no pid. Only ever from an explicit prune —
+    # the implicit ones inside `who`/`join` never pass it.
+    force=""; [ "${1:-}" = "--force" ] && force=1
+    lock; reaped="$(prune_dead "$force")"; unlock
     swept="$(blob_sweep)"       # only the explicit prune sweeps blobs; who/join stay cheap
     if [ -z "$reaped" ] && [ -z "$swept" ]; then echo "nothing to prune."; fi
-    for h in $reaped; do echo "reaped: @$h (process gone)"; done
+    for h in $reaped; do echo "reaped: @$h"; done
     [ -n "$swept" ] && echo "swept: $swept blob(s) older than ${SESSION_BUS_BLOB_DAYS:-30}d"
     ;;
   catchup)
@@ -370,6 +425,7 @@ case "$cmd" in
     tail -n "${1:-80}" "$LOG"
     ;;
   leave)
+    lf=""; [ "${1:-}" = "--force" ] && { lf=1; shift; }   # accept --force before the target too
     case "${1:-}" in
       # Used by the SessionEnd hook: deregister whoever this session registered as.
       # Silent no-op (rc 0) when the session never joined — the hook fires for every
@@ -384,7 +440,7 @@ case "$cmd" in
       # Fallback for when no session id is available. Ambiguous by design when
       # several handles share a cwd, so it refuses rather than guessing.
       --by-cwd)
-        force=""; [ "${2:-}" = "--force" ] && { force=1; shift; }
+        force="$lf"; [ "${2:-}" = "--force" ] && { force=1; shift; }
         p="${2:?usage: bus leave --by-cwd [--force] <path>}"
         lock
         hs="$(handles_by_cwd "$p")"
@@ -394,11 +450,35 @@ case "$cmd" in
           echo "error: $n handles registered at $p ($(echo $hs | tr '\n' ' ')) — pass a handle explicitly, or --force to drop all" >&2
           exit 1
         fi
-        for h in $hs; do do_leave "$h"; echo "left: @$h"; done
+        # Without a session id this is a guess from the working directory, and a
+        # handle that changed hands makes it the wrong guess. Never remove a row
+        # whose process is still running — unless that process is US, which is
+        # the normal case: at SessionEnd the ending session is still alive and
+        # is the one running this hook.
+        me="$(claude_pid)"
+        for h in $hs; do
+          if [ -z "$force" ] && row_alive "$h" && [ "$(row_field "$h" 5)" != "${me:-}" ]; then
+            echo "kept @$h: registered to a live process (pid $(row_field "$h" 5)) that is not this session"
+            continue
+          fi
+          do_leave "$h"; echo "left: @$h"
+        done
         ;;
       *)
-        h="${1:?usage: bus leave <handle> | --by-session <id> | --by-cwd [--force] <path>}"
+        h="${1:?usage: bus leave [--force] <handle> | --by-session <id> | --by-cwd [--force] <path>}"
+        [ "${2:-}" = "--force" ] && lf=1
         lock
+        # A displaced session must not deregister whoever holds the name now.
+        # Only enforced when both sides identify themselves: a row with no
+        # session id, or a call from a plain shell, stays freely removable so
+        # hand cleanup still works.
+        row_sid="$(row_field "$h" 4)"; my_sid="${CLAUDE_CODE_SESSION_ID:-}"
+        if [ -z "$lf" ] && [ -n "${row_sid:-}" ] && [ -n "$my_sid" ] && [ "$row_sid" != "$my_sid" ]; then
+          unlock
+          echo "error: @$h is registered to a different session ($row_sid), not this one." >&2
+          echo "       It is probably still listening. Pass --force to deregister it anyway." >&2
+          exit 1
+        fi
         do_leave "$h"
         echo "left."
         ;;
@@ -408,17 +488,20 @@ case "$cmd" in
     cat >&2 <<'EOF'
 bus — local coordination for Claude Code sessions
   bus join [handle]              register + print your Monitor listen command
-                                 (no handle => a slug of the current directory)
+                                 (no handle => a slug of the current directory;
+                                 a handle a live session already holds is refused)
   bus send <from> @to [..] msg   post a message tagging recipient(s); @all = broadcast
                                  (multi-line/large payloads auto-store as a blob)
   bus put [file]                 store a payload (file or stdin); prints its blob key
   bus get <key>                  print a stored payload
   bus who                        list registered handles (reaps dead ones first)
-  bus prune                      drop handles whose process is gone; sweep old blobs
+  bus prune [--force]            drop handles whose process is gone; sweep old blobs
+                                 (--force also drops rows that recorded no pid)
   bus catchup <handle> [hours]   mentions you have not been shown yet (exact, via a
                                  read cursor); pass N hours to override with a window
   bus log [N]                    tail the shared log for full context (default 80)
-  bus leave <handle>             deregister
+  bus leave [--force] <handle>   deregister (--force: also when the row belongs to
+                                 another session — e.g. reclaiming a taken name)
   bus leave --by-session <id>    deregister whatever that Claude session joined as (used by the SessionEnd hook)
   bus leave --by-cwd [--force] <path>
                                  deregister by working directory (refuses if >1 handle shares it)

@@ -157,6 +157,64 @@ assert_contains "get rejects a path as a key" "$("$BUS" get ../../etc/passwd 2>&
 assert_contains "get reports a missing blob"  "$("$BUS" get no-such-key 2>&1)" "no such blob"
 
 # ---------------------------------------------------------------------------
+section "handle ownership (one live session per name)"
+dead_pid2() { ( exit 0 ) & p=$!; wait "$p" 2>/dev/null; printf '%s' "$p"; }
+livestart="$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
+LIVEROW() { printf '%s|%s|2026-08-05 13:00|%s|%s|%s\n' "$1" "${3:-/p}" "$2" "$$" "$livestart" >> "$SESSION_BUS_DIR/roster"; }
+
+fresh
+LIVEROW apb SID-X
+out="$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join apb 2>&1)"; rc=$?
+assert_eq       "join refuses a name a live session holds" "$rc" "1"
+assert_contains "refusal says the name is taken"           "$out" "@apb is taken"
+assert_contains "refusal suggests a free alternative"      "$out" "Try @apb2"
+assert_eq       "refused join did not touch the roster"    "$(grep -c '^apb|' "$SESSION_BUS_DIR/roster")" "1"
+assert_contains "holder's session id survives the attempt" "$(cat "$SESSION_BUS_DIR/roster")" "SID-X"
+LIVEROW apb2 SID-Y
+assert_contains "suffix suggestion skips taken names"      "$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join apb 2>&1)" "Try @apb3"
+
+# The normal restart: the previous holder's process is gone, so the name is free.
+fresh
+printf 'ugs|/p|2026-08-04 10:00|SID-OLD|%s|\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/roster"
+assert_contains "restart reclaims a name whose process died" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-NEW "$BUS" join ugs 2>&1)" "joined as 'ugs'"
+assert_contains "reclaimed row carries the new session id" "$(cat "$SESSION_BUS_DIR/roster")" "SID-NEW"
+fresh
+LIVEROW mc SID-A
+assert_contains "same session re-registering is not a collision" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" join mc 2>&1)" "joined as 'mc'"
+
+# Removal is session-keyed too, or a displaced session evicts the live holder.
+fresh
+LIVEROW mc SID-LIVE
+out="$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave mc 2>&1)"; rc=$?
+assert_eq       "another session cannot leave on your behalf"  "$rc" "1"
+assert_contains "refusal names the owning session"             "$out" "SID-LIVE"
+assert_contains "holder still registered after refused leave"  "$("$BUS" who)" "@mc"
+assert_contains "--force reclaims deliberately" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave --force mc 2>&1)" "left."
+fresh
+LIVEROW mc SID-LIVE
+assert_contains "the owner can always leave"      "$(CLAUDE_CODE_SESSION_ID=SID-LIVE "$BUS" leave mc 2>&1)" "left."
+fresh
+printf 'legacy|/p|2026-08-01 10:00|SID-GONE||\n' > "$SESSION_BUS_DIR/roster"
+assert_contains "hand cleanup from a plain shell still works" \
+  "$(env -u CLAUDE_CODE_SESSION_ID "$BUS" leave legacy 2>&1)" "left."
+
+# --by-cwd is a guess; it must not evict a row whose process is still running.
+fresh
+LIVEROW held SID-Z /p/x
+assert_contains "--by-cwd keeps a live row from another session" \
+  "$("$BUS" leave --by-cwd /p/x 2>&1)" "kept @held"
+assert_contains "kept row is still registered" "$("$BUS" who)" "@held"
+assert_contains "--by-cwd --force overrides the keep" \
+  "$("$BUS" leave --by-cwd --force /p/x 2>&1)" "left: @held"
+fresh
+printf 'goner|/p/x|2026-08-05 13:00|SID-G|%s|\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/roster"
+assert_contains "--by-cwd still removes a row whose process is gone" \
+  "$("$BUS" leave --by-cwd /p/x 2>&1)" "left: @goner"
+
+# ---------------------------------------------------------------------------
 section "who liveness"
 fresh
 J='2026-08-03 00:00'
@@ -225,6 +283,21 @@ assert_contains     "pid-less row kept (not provably dead)" "$w" "@legacy"
 assert_contains     "reap is logged as offline"         "$(cat "$SESSION_BUS_DIR/bus.log")" "[ghost"
 assert_contains     "reap says why"                     "$(cat "$SESSION_BUS_DIR/bus.log")" "reaped"
 assert_contains     "nothing left to prune the 2nd time" "$("$BUS" prune)" "nothing to prune"
+
+# --force: the explicit "I know these are gone" sweep for pid-less rows. It is
+# never passed by the implicit prunes inside who/join.
+fresh
+ROW legacy2 sess-x2 ""    ""            # unjudgeable
+ROW alive2  sess-l2 "$$"  "$mystart"    # provably live
+assert_contains     "implicit prune (via who) keeps pid-less rows" "$("$BUS" who)" "@legacy2"
+f="$("$BUS" prune --force)"
+assert_contains     "--force reports the dropped row"   "$f" "reaped: @legacy2"
+w="$("$BUS" who)"
+assert_not_contains "--force drops the pid-less row"    "$w" "@legacy2"
+assert_contains     "--force still spares a live row"   "$w" "@alive2"
+assert_contains     "forced drop is logged as forced"   "$(cat "$SESSION_BUS_DIR/bus.log")" "dropped by --force"
+assert_not_contains "forced drop is not logged as proven-gone" \
+  "$(grep legacy2 "$SESSION_BUS_DIR/bus.log")" "session process gone"
 
 # pid reuse: same pid, different start time => the row's session is gone
 fresh
