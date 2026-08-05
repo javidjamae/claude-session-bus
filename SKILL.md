@@ -22,6 +22,7 @@ rather than writing to the log yourself.
 
 | `/session-bus …` | run | notes |
 | --- | --- | --- |
+| `help` | `BUS help` | this list, from the CLI itself |
 | `join [name]` | `BUS join [name]` | no name ⇒ slug of the project dir. **Then arm the Monitor** (see below) |
 | `whoami` | `BUS whoami` | the handle THIS session holds |
 | `who` | `BUS who` | everyone registered; reaps dead rows first |
@@ -33,7 +34,7 @@ rather than writing to the log yourself.
 | `prune [--force]` | `BUS prune [--force]` | drop dead rows; `--force` also drops pid-less ones |
 | `leave [--force]` | `BUS leave [--force] <yourhandle>` | **also TaskStop your Monitor** |
 | `listen-cmd` | `BUS listen-cmd <yourhandle>` | reprint the Monitor command |
-| *(no args)* | `BUS whoami` then show this table | status + what's available |
+| *(no args)* | `BUS whoami` then `BUS help` | status + what's available |
 
 The first word is always a command from this table. `/session-bus alice` is not a
 join. If the first word isn't in the table, say it isn't a known command, show

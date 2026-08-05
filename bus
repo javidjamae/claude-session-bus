@@ -247,6 +247,34 @@ window_catchup() {
   ' "$LOG" 2>/dev/null
 }
 
+usage() {
+  cat <<'EOF'
+bus — local coordination for Claude Code sessions
+
+  bus help                       this list
+  bus join [handle]              register + print your Monitor listen command
+                                 (no handle => a slug of the current directory;
+                                 a handle a live session already holds is refused)
+  bus whoami                     the handle THIS session is registered as
+  bus who                        list registered handles (reaps dead ones first)
+  bus send <from> @to [..] msg   post a message tagging recipient(s); @all = broadcast
+                                 (multi-line/large payloads auto-store as a blob)
+  bus catchup <handle> [hours]   mentions you have not been shown yet (exact, via a
+                                 read cursor); pass N hours to override with a window
+  bus log [N]                    tail the shared log for full context (default 80)
+  bus put [file]                 store a payload (file or stdin); prints its blob key
+  bus get <key>                  print a stored payload
+  bus prune [--force]            drop handles whose process is gone; sweep old blobs
+                                 (--force also drops rows that recorded no pid)
+  bus listen-cmd <handle>        reprint the Monitor listen command
+  bus leave [--force] <handle>   deregister (--force: also when the row belongs to
+                                 another session — e.g. reclaiming a taken name)
+  bus leave --by-session <id>    deregister whatever that Claude session joined as (used by the SessionEnd hook)
+  bus leave --by-cwd [--force] <path>
+                                 deregister by working directory (refuses if >1 handle shares it)
+EOF
+}
+
 cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
   join)
@@ -509,29 +537,13 @@ case "$cmd" in
         ;;
     esac
     ;;
+  help|-h|--help|'?')
+    usage
+    ;;
   *)
-    cat >&2 <<'EOF'
-bus — local coordination for Claude Code sessions
-  bus join [handle]              register + print your Monitor listen command
-                                 (no handle => a slug of the current directory;
-                                 a handle a live session already holds is refused)
-  bus send <from> @to [..] msg   post a message tagging recipient(s); @all = broadcast
-                                 (multi-line/large payloads auto-store as a blob)
-  bus put [file]                 store a payload (file or stdin); prints its blob key
-  bus get <key>                  print a stored payload
-  bus whoami                     the handle THIS session is registered as
-  bus who                        list registered handles (reaps dead ones first)
-  bus prune [--force]            drop handles whose process is gone; sweep old blobs
-                                 (--force also drops rows that recorded no pid)
-  bus catchup <handle> [hours]   mentions you have not been shown yet (exact, via a
-                                 read cursor); pass N hours to override with a window
-  bus log [N]                    tail the shared log for full context (default 80)
-  bus leave [--force] <handle>   deregister (--force: also when the row belongs to
-                                 another session — e.g. reclaiming a taken name)
-  bus leave --by-session <id>    deregister whatever that Claude session joined as (used by the SessionEnd hook)
-  bus leave --by-cwd [--force] <path>
-                                 deregister by working directory (refuses if >1 handle shares it)
-EOF
+    [ -n "$cmd" ] && echo "bus: unknown command '$cmd'" >&2
+    usage >&2
     exit 1
     ;;
 esac
+exit 0

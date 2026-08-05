@@ -215,6 +215,28 @@ assert_contains "--by-cwd still removes a row whose process is gone" \
   "$("$BUS" leave --by-cwd /p/x 2>&1)" "left: @goner"
 
 # ---------------------------------------------------------------------------
+section "help"
+fresh
+h="$("$BUS" help 2>/dev/null)"
+assert_contains "help prints to stdout"      "$h" "bus — local coordination"
+"$BUS" help >/dev/null 2>&1
+assert_eq       "help exits 0"               "$?" "0"
+for a in -h --help; do
+  assert_contains "$a is an alias for help"  "$("$BUS" "$a" 2>/dev/null)" "bus join"
+done
+u="$("$BUS" jion 2>&1 >/dev/null)"
+assert_contains "unknown command names the input" "$u" "unknown command 'jion'"
+assert_contains "unknown command shows usage on stderr" "$u" "bus join"
+"$BUS" jion >/dev/null 2>&1
+assert_eq       "unknown command exits 1"    "$?" "1"
+# Guard against drift: every implemented subcommand must appear in help.
+missing=""
+for c in $(awk '/^cmd=/{f=1} f && /^  [a-z][a-z-]*\)$/{gsub(/[ )]/,"");print}' "$BUS"); do
+  printf '%s\n' "$h" | grep -qE "^  bus $c( |$)" || missing="$missing $c"
+done
+assert_eq "help documents every subcommand" "${missing# }" ""
+
+# ---------------------------------------------------------------------------
 section "whoami"
 fresh
 assert_contains "not joined -> says so"      "$("$BUS" whoami 2>&1)" "not on the bus"
