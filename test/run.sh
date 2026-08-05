@@ -215,6 +215,55 @@ assert_contains "--by-cwd still removes a row whose process is gone" \
   "$("$BUS" leave --by-cwd /p/x 2>&1)" "left: @goner"
 
 # ---------------------------------------------------------------------------
+section "help"
+fresh
+h="$("$BUS" help 2>/dev/null)"
+assert_contains "help prints to stdout"      "$h" "bus — local coordination"
+"$BUS" help >/dev/null 2>&1
+assert_eq       "help exits 0"               "$?" "0"
+for a in -h --help; do
+  assert_contains "$a is an alias for help"  "$("$BUS" "$a" 2>/dev/null)" "bus join"
+done
+u="$("$BUS" jion 2>&1 >/dev/null)"
+assert_contains "unknown command names the input" "$u" "unknown command 'jion'"
+assert_contains "unknown command shows usage on stderr" "$u" "bus join"
+"$BUS" jion >/dev/null 2>&1
+assert_eq       "unknown command exits 1"    "$?" "1"
+# Guard against drift: every implemented subcommand must appear in help.
+missing=""
+for c in $(awk '/^cmd=/{f=1} f && /^  [a-z][a-z-]*\)$/{gsub(/[ )]/,"");print}' "$BUS"); do
+  printf '%s\n' "$h" | grep -qE "^  bus $c( |$)" || missing="$missing $c"
+done
+assert_eq "help documents every subcommand" "${missing# }" ""
+
+# ---------------------------------------------------------------------------
+section "whoami"
+fresh
+assert_contains "not joined -> says so"      "$("$BUS" whoami 2>&1)" "not on the bus"
+"$BUS" whoami >/dev/null 2>&1
+assert_eq       "not joined -> rc 1"         "$?" "1"
+CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice >/dev/null 2>&1
+o="$(CLAUDE_CODE_SESSION_ID=SID-W "$BUS" whoami 2>&1)"
+assert_contains "reports this session's handle" "$o" "@alice"
+assert_contains "says how it matched"           "$o" "matched by session id"
+assert_contains "reprints the listen command"   "$o" "bus-filter alice"
+# A sibling session in the same repo must resolve to itself, not its neighbour —
+# the reason whoami keys on session id rather than cwd in the first place.
+CLAUDE_CODE_SESSION_ID=SID-V "$BUS" join alice2 >/dev/null 2>&1
+o="$(CLAUDE_CODE_SESSION_ID=SID-V "$BUS" whoami 2>&1)"
+assert_contains     "sibling in same cwd resolves to itself"  "$o" "@alice2"
+assert_not_contains "sibling did not fall back to a cwd guess" "$o" "a guess"
+o="$(CLAUDE_CODE_SESSION_ID=SID-W "$BUS" whoami 2>&1)"
+assert_contains     "the first session still resolves to itself" "$o" "@alice"
+assert_not_contains "and is not confused by its sibling"         "$o" "@alice2"
+# Neither id nor pid: a cwd match is explicitly labelled a guess.
+fresh
+printf 'ghost|%s|2026-08-05 13:00|||\n' "$PWD" > "$SESSION_BUS_DIR/roster"
+o="$(env -u CLAUDE_CODE_SESSION_ID "$BUS" whoami 2>&1)"
+assert_contains "cwd fallback still answers"  "$o" "@ghost"
+assert_contains "cwd fallback admits it is a guess" "$o" "a guess"
+
+# ---------------------------------------------------------------------------
 section "who liveness"
 fresh
 J='2026-08-03 00:00'
