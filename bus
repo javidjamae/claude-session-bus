@@ -10,7 +10,9 @@ set -uo pipefail
 BUS_DIR="${SESSION_BUS_DIR:-$HOME/.claude/session-bus}"
 LOG="$BUS_DIR/bus.log"
 ROSTER="$BUS_DIR/roster"
-mkdir -p "$BUS_DIR"; : >>"$LOG"; : >>"$ROSTER"
+CURSORS="$BUS_DIR/cursors"   # one file per handle: how far into bus.log it has read
+BLOBS="$BUS_DIR/blobs"       # payloads too big or too multi-line to inline in the log
+mkdir -p "$BUS_DIR" "$CURSORS" "$BLOBS"; : >>"$LOG"; : >>"$ROSTER"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 # Timestamp for log lines. Dated so messages are unambiguous across days.
@@ -24,6 +26,60 @@ now_minus_hours() {
   date -v-"$1"H '+%m-%d %H:%M' 2>/dev/null || date -d "-$1 hours" '+%m-%d %H:%M' 2>/dev/null
 }
 
+# --- read cursors -----------------------------------------------------------
+# Each handle records a byte offset into the append-only log: everything before
+# it has been shown to that handle, so `catchup` is simply "the rest of the file,
+# filtered to my mentions" — exact and uncapped, where a time window would be a
+# guess wrong in both directions (a long absence loses messages past the edge, a
+# busy day gets truncated).
+#
+# The offset is advanced by `catchup` itself and by a *graceful* leave (at which
+# point the session's listener had been armed the whole time, so the log really
+# was delivered live). It is deliberately NOT advanced when `prune` reaps a
+# hard-killed session: we cannot know when that session stopped reading, so its
+# successor re-sees some already-delivered messages. Every ambiguity here
+# resolves toward showing a message twice rather than dropping it once.
+
+log_size() { wc -c <"$LOG" 2>/dev/null | tr -d ' '; }
+
+cursor_file() { printf '%s/%s' "$CURSORS" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-')"; }
+cursor_get()  { _cf="$(cursor_file "$1")"; [ -f "$_cf" ] || return 1; cat "$_cf" 2>/dev/null; }
+# Monotonic: a stale writer (an old session leaving late) must never rewind a
+# cursor that a live session has already advanced past.
+cursor_set() {
+  _cf="$(cursor_file "$1")"; _cur="$(cat "$_cf" 2>/dev/null)"
+  case "${_cur:-}" in ''|*[!0-9]*) _cur=0;; esac
+  case "${2:-}" in ''|*[!0-9]*) return 0;; esac
+  [ "$2" -gt "$_cur" ] && printf '%s\n' "$2" >"$_cf"
+  return 0
+}
+
+# --- blobs ------------------------------------------------------------------
+# The log is line-oriented: one message, one line, address field first. A raw
+# newline in a message body would write continuation lines carrying no address
+# field at all — bus-filter drops them and the recipient silently receives a
+# truncated message. So anything multi-line or oversized is stored whole in a
+# blob and the log carries a one-line preview plus its key.
+
+blob_put() {  # <file> -> prints the key
+  _sum="$(cksum <"$1" 2>/dev/null | awk '{n=$1; print substr(n, length(n)-4)}')"
+  _k="$(date '+%Y%m%d-%H%M%S')-${_sum:-00000}"
+  cp "$1" "$BLOBS/$_k" 2>/dev/null || return 1
+  printf '%s' "$_k"
+}
+
+# Drop blobs nobody is going to ask for again. Prints the count (never silent).
+blob_sweep() {
+  _days="${SESSION_BUS_BLOB_DAYS:-30}"
+  [ -d "$BLOBS" ] || return 0
+  _n=0
+  for _f in $(find "$BLOBS" -type f -mtime +"$_days" 2>/dev/null); do
+    rm -f "$_f" 2>/dev/null && _n=$((_n+1))
+  done
+  [ "$_n" -gt 0 ] && printf '%s' "$_n"
+  return 0
+}
+
 # Print the exact Monitor listen command for a handle. Two guards prevent false wakes:
 #  1. Match @<handle>/@all only in the ADDRESS field (before the ' :: ' delimiter),
 #     so an @mention inside a message body never triggers a wake.
@@ -34,13 +90,76 @@ listen_cmd() {
 
 roster_drop() { grep -v -iE "^$1\\|" "$ROSTER" >"$ROSTER.tmp" 2>/dev/null; mv "$ROSTER.tmp" "$ROSTER" 2>/dev/null; return 0; }
 
-# Roster line format: handle|cwd|joined|session_id
+# Roster line format: handle|cwd|joined|session_id|pid|pstart
 # Field 4 (Claude Code session id, from $CLAUDE_CODE_SESSION_ID at join time) is
 # what the SessionEnd hook matches on, so auto-leave removes exactly the ending
-# session's entry — several sessions can share a cwd. Legacy 3-field lines simply
-# have an empty field 4 and are never auto-left.
+# session's entry — several sessions can share a cwd. Fields 5/6 are the owning
+# Claude Code process and its start time, used by `prune` (see below). Legacy
+# 3/4-field lines simply have those fields empty; they are never auto-left or
+# reaped, and are rewritten to the full width the first time `prune` runs.
 handles_by_session() { awk -F'|' -v s="$1" '$4 != "" && $4 == s { print $1 }' "$ROSTER" 2>/dev/null; }
 handles_by_cwd()     { awk -F'|' -v c="$1" '$2 == c { print $1 }' "$ROSTER" 2>/dev/null; }
+
+# --- liveness ---------------------------------------------------------------
+# The SessionEnd hook only covers *graceful* endings. A hard kill — SIGKILL, a
+# closed terminal window, a crash — never fires it, and used to strand a roster
+# row forever. So `join` also records the pid of the Claude Code process that
+# owns the session; a row whose process is gone is provably dead and gets reaped.
+# This is a check, not a timeout: an idle-but-listening session stays listed no
+# matter how long it has been quiet, which a last-activity TTL would get wrong.
+
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'; }
+
+# Walk up from this script to the owning `claude` process. Empty if there isn't
+# one (bus run straight from a shell), which simply means "not reapable".
+claude_pid() {
+  p="$$"; i=0
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ] && [ "$i" -lt 12 ]; do
+    c="$(ps -o comm= -p "$p" 2>/dev/null)"
+    [ -n "$c" ] || return 0
+    case "${c##*/}" in claude|claude-code) printf '%s' "$p"; return 0;; esac
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    i=$((i+1))
+  done
+}
+
+# Drop rows whose owning process is gone (or whose pid was recycled by a
+# different process — hence the start-time guard). Prints the reaped handles.
+# Rows with no pid are kept: absence of proof of death is not proof of death.
+# Caller must hold the lock.
+prune_dead() {
+  command -v ps >/dev/null 2>&1 || return 0
+  [ -s "$ROSTER" ] || return 0
+  # Every variable here is _p-prefixed on purpose: this runs inside `join`, and a
+  # plainly-named `read -r ... sid ...` silently overwrote the joining session's
+  # own $sid — which wrote an empty session id to the roster and quietly disabled
+  # auto-leave for that handle.
+  reaped=""
+  : >"$ROSTER.tmp"
+  while IFS='|' read -r _ph _pcwd _pjoined _psid _ppid _pstart || [ -n "${_ph:-}" ]; do
+    [ -n "${_ph:-}" ] || continue
+    case "${_ppid:-}" in
+      ''|*[!0-9]*) ;;                                  # no/non-numeric pid: unjudgeable, keep
+      *)
+        _pcur="$(proc_start "$_ppid")"
+        if [ -z "$_pcur" ] || { [ -n "${_pstart:-}" ] && [ "$_pcur" != "$_pstart" ]; }; then
+          reaped="$reaped $_ph"
+          _ph=""; continue
+        fi
+        ;;
+    esac
+    printf '%s|%s|%s|%s|%s|%s\n' "$_ph" "${_pcwd:-}" "${_pjoined:-}" "${_psid:-}" "${_ppid:-}" "${_pstart:-}" >>"$ROSTER.tmp"
+    _ph=""
+  done < "$ROSTER"
+  mv "$ROSTER.tmp" "$ROSTER" 2>/dev/null
+  # deliberately obscure loop variable: this runs inside `join`, whose own $h
+  # must survive the call (a plain `for h` here silently re-registered a reaped
+  # handle instead of the joining one).
+  for _reap_h in $reaped; do
+    printf '[%s %s] offline (reaped: session process gone)\n' "$_reap_h" "$(now)" >>"$LOG"
+    printf '%s\n' "$_reap_h"
+  done
+}
 
 # Coarse mutex around roster read-modify-write. The SessionEnd hook makes
 # concurrent mutations real (two sessions can end at the same instant), and
@@ -58,18 +177,69 @@ lock() {
   trap unlock EXIT
 }
 
-# Deregister one handle: drop from roster, note it in the log.
-do_leave() { roster_drop "$1"; printf '[%s %s] offline\n' "$1" "$(now)" >>"$LOG"; }
+# Deregister one handle: drop from roster, note it in the log, mark the log read.
+# The cursor advance is what makes the *next* session's catchup exact: this
+# session listened right up to this instant, so the gap starts here and nowhere
+# else. Only graceful endings get this — see the read-cursor notes above.
+do_leave() {
+  roster_drop "$1"
+  printf '[%s %s] offline\n' "$1" "$(now)" >>"$LOG"
+  cursor_set "$1" "$(log_size)"
+}
+
+# Time-windowed catchup: the fallback for handles with no cursor yet, and what
+# you get when you ask for a window explicitly. Keep only lines tagging @h/@all
+# (never self), then only lines newer than the cutoff. The timestamp is fields 2
+# (MM-DD) and 3 (HH:MM]) of the '[' address token; a lexical compare of
+# 'MM-DD HH:MM' is correct within a calendar year. Undated legacy lines are
+# dropped when a window applies — their recency cannot be proven, and keeping
+# them reproduces the old "re-dump everything" noise. They stay visible via
+# 'bus log'. Self-heals once every session emits dated lines.
+window_catchup() {
+  awk -v h="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" -v cut="$(now_minus_hours "$2")" -F' :: ' '
+    { a = tolower($1) }
+    a ~ ("^\\[" h " ") { next }                              # drop self
+    a !~ ("@(" h "|all)([^0-9a-z_]|$)") { next }             # must tag h/all
+    {
+      split($1, p, " ")                                      # p[2]=MM-DD p[3]=HH:MM]
+      if (p[2] ~ /^[0-9][0-9]-[0-9][0-9]$/) {
+        ts = p[2] " " substr(p[3], 1, 5)
+        if (cut != "" && ts < cut) next                      # dated + older than window: drop
+      } else if (cut != "") {
+        next                                                 # undated (pre-dated-stamp): cannot prove recency, drop
+      }
+      print
+    }
+  ' "$LOG" 2>/dev/null
+}
 
 cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
   join)
-    h="${1:?usage: bus join <handle>}"
+    h="${1:-}"
     sid="${CLAUDE_CODE_SESSION_ID:-}"   # exported into every Bash tool call by Claude Code
+    cpid="$(claude_pid)"                # owning Claude Code process, for the hard-kill reaper
+    cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
     lock
+    prune_dead >/dev/null               # joining is a good moment to reap dead rows
+    if [ -z "$h" ]; then
+      # No handle given: derive one from the project directory, and if a *live*
+      # session already holds it, suffix instead of stealing it (two sessions in
+      # one repo is the normal case). An explicitly-given handle is never
+      # suffixed — reusing it deliberately re-registers, e.g. after a restart.
+      base="$(printf '%s' "${PWD##*/}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
+      [ -n "$base" ] || base="session"
+      h="$base"; n=1
+      while grep -qiE "^$h\|" "$ROSTER" 2>/dev/null; do n=$((n+1)); h="$base$n"; done
+    fi
     roster_drop "$h"
-    printf '%s|%s|%s|%s\n' "$h" "$PWD" "$(date '+%Y-%m-%d %H:%M')" "$sid" >>"$ROSTER"
+    printf '%s|%s|%s|%s|%s|%s\n' "$h" "$PWD" "$(date '+%Y-%m-%d %H:%M')" "$sid" "$cpid" "$cstart" >>"$ROSTER"
     printf '[%s %s] online (%s)\n' "$h" "$(now)" "$PWD" >>"$LOG"   # unmentioned: context only, wakes no one
+    # Seed a read cursor for a handle that has never had one, so its first
+    # `catchup` shows nothing rather than the entire history. A cursor that
+    # already exists is left strictly alone — that IS the unread gap, and this
+    # is the moment we would otherwise destroy it.
+    cursor_get "$h" >/dev/null 2>&1 || cursor_set "$h" "$(log_size)"
     unlock
     echo "joined as '$h'. Arm your listener with this Monitor command (persistent):"
     listen_cmd "$h"
@@ -85,19 +255,64 @@ case "$cmd" in
     [ -n "$tos" ] || { echo "error: no @recipient (e.g. bus send alice @bob \"hi\")" >&2; exit 1; }
     msg="$*"
     [ -n "$msg" ] || { echo "error: empty message" >&2; exit 1; }
+    # A message that spans lines cannot go in the log as-is: only its first line
+    # would carry the address field, and bus-filter would drop the rest — a
+    # silent truncation with no error anywhere. Offload those (and anything
+    # oversized) to a blob, and leave a one-line preview + key in the log.
+    inline_max="${SESSION_BUS_INLINE_MAX:-800}"
+    bytes="$(printf '%s' "$msg" | wc -c | tr -d ' ')"
+    lines="$(printf '%s\n' "$msg" | wc -l | tr -d ' ')"
+    if [ "$lines" -gt 1 ] || [ "$bytes" -gt "$inline_max" ]; then
+      tmp="$BLOBS/.tmp.$$"; printf '%s\n' "$msg" >"$tmp"
+      key="$(blob_put "$tmp")"; rm -f "$tmp"
+      [ -n "$key" ] || { echo "error: could not write blob" >&2; exit 1; }
+      # Preview: first line only, tabs/CRs flattened, clipped — the log stays
+      # one-line-per-message and greppable no matter what was sent.
+      preview="$(printf '%s\n' "$msg" | head -1 | tr '\t\r' '  ' | cut -c1-160)"
+      msg="$preview … [blob $key: $lines lines, $bytes bytes — read it with: bus get $key]"
+    fi
     printf '[%s %s]%s :: %s\n' "$from" "$(now)" "$tos" "$msg" >>"$LOG"   # ' :: ' delimits address field from body
-    echo "sent to$tos"
+    if [ -n "${key:-}" ]; then echo "sent to$tos (payload stored as blob $key)"; else echo "sent to$tos"; fi
+    ;;
+  put)
+    # Store a payload without routing it anywhere; prints the key to reference in
+    # a later `send`. Takes a path, or stdin — so a large file never has to be
+    # squeezed through argv.
+    src="${1:-}"
+    if [ -n "$src" ]; then
+      [ -f "$src" ] || { echo "error: no such file: $src" >&2; exit 1; }
+      key="$(blob_put "$src")"
+    else
+      tmp="$BLOBS/.tmp.$$"; cat >"$tmp"
+      [ -s "$tmp" ] || { rm -f "$tmp"; echo "error: empty payload on stdin" >&2; exit 1; }
+      key="$(blob_put "$tmp")"; rm -f "$tmp"
+    fi
+    [ -n "$key" ] || { echo "error: could not write blob" >&2; exit 1; }
+    printf '%s\n' "$key"
+    ;;
+  get)
+    key="${1:?usage: bus get <blob-key>}"
+    case "$key" in */*|..*) echo "error: bad blob key: $key" >&2; exit 1;; esac  # keys are flat names, never paths
+    [ -f "$BLOBS/$key" ] || { echo "error: no such blob: $key" >&2; exit 1; }
+    cat "$BLOBS/$key"
     ;;
   who)
+    lock; reaped="$(prune_dead)"; unlock
+    for h in $reaped; do echo "  (reaped @$h — its Claude Code process is gone)"; done
     if [ ! -s "$ROSTER" ]; then echo "(nobody registered)"; exit 0; fi
-    # Liveness is best-effort: there is no heartbeat, so we infer it from each
-    # handle's LAST activity in the log. Older than the stale window => 'stale?'
-    # (likely ended without 'bus leave', or just idle). Undated legacy lines can't
-    # be judged and are shown without a flag.
+    # Two tiers of liveness. Rows that recorded a pid have just been checked
+    # against the process table by prune_dead, so surviving ones are genuinely
+    # live — quiet is not stale. Rows without a pid (joined outside Claude Code,
+    # or before this feature) fall back to the old guess: infer from the handle's
+    # LAST activity in the log, flagging anything past the stale window.
     stale_hours=6
     stale_cut="$(now_minus_hours "$stale_hours")"
-    while IFS='|' read -r hh pwd joined sid; do
+    while IFS='|' read -r hh pwd joined sid pid pstart; do
       [ -n "$hh" ] || continue
+      case "${pid:-}" in
+        ''|*[!0-9]*) ;;
+        *) printf "  @%-10s %s (joined %s, process live — pid %s)\n" "$hh" "$pwd" "$joined" "$pid"; continue;;
+      esac
       last="$(grep -iE "^\[$hh " "$LOG" 2>/dev/null | tail -1)"
       seen=""; flag=""
       if [ -n "$last" ]; then
@@ -115,33 +330,41 @@ case "$cmd" in
         printf "  @%-10s %s (joined %s, no activity logged — stale?)\n" "$hh" "$pwd" "$joined"
       fi
     done < "$ROSTER"
-    printf "  (liveness is best-effort — 'last seen' = last bus activity; a session may be idle-but-listening, or ended without 'bus leave')\n"
+    printf "  ('process live' is checked against the process table; 'last seen' rows predate that check and are only a guess)\n"
+    ;;
+  prune)
+    lock; reaped="$(prune_dead)"; unlock
+    swept="$(blob_sweep)"       # only the explicit prune sweeps blobs; who/join stay cheap
+    if [ -z "$reaped" ] && [ -z "$swept" ]; then echo "nothing to prune."; fi
+    for h in $reaped; do echo "reaped: @$h (process gone)"; done
+    [ -n "$swept" ] && echo "swept: $swept blob(s) older than ${SESSION_BUS_BLOB_DAYS:-30}d"
     ;;
   catchup)
     h="${1:?usage: bus catchup <handle> [hours]}"
-    hours="${2:-12}"
-    cut="$(now_minus_hours "$hours")"
-    # Filter mentions of @h/@all (not self), then keep only lines newer than the
-    # cutoff. Timestamp is fields 2 (MM-DD) + 3 (HH:MM]) of the '[' address token;
-    # lexical compare of 'MM-DD HH:MM' is correct within a year. Undated legacy
-    # lines (pre-dated-stamp) are dropped when a window applies — their recency
-    # cannot be proven, and keeping them reproduces the old "re-dump" noise.
-    # They remain visible via 'bus log'. Self-heals once sessions emit dated lines.
-    awk -v h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')" -v cut="$cut" -F' :: ' '
-      { a = tolower($1) }
-      a ~ ("^\\[" h " ") { next }                              # drop self
-      a !~ ("@(" h "|all)([^0-9a-z_]|$)") { next }             # must tag h/all
-      {
-        split($1, p, " ")                                      # p[2]=MM-DD p[3]=HH:MM]
-        if (p[2] ~ /^[0-9][0-9]-[0-9][0-9]$/) {
-          ts = p[2] " " substr(p[3], 1, 5)
-          if (cut != "" && ts < cut) next                      # dated + older than window: drop
-        } else if (cut != "") {
-          next                                                 # undated (pre-dated-stamp): cannot prove recency, drop
-        }
-        print
-      }
-    ' "$LOG" 2>/dev/null | tail -40
+    hours="${2:-}"
+    size="$(log_size)"
+    if [ -n "$hours" ]; then
+      out="$(window_catchup "$h" "$hours")"          # explicit window: an override, not the default
+    else
+      off="$(cursor_get "$h" 2>/dev/null)" || off=""
+      case "${off:-}" in ''|*[!0-9]*) off="";; esac
+      if [ -z "$off" ]; then
+        # No cursor at all: a handle from before cursors existed, or one that
+        # never joined. Fall back to the old window rather than dumping history.
+        out="$(window_catchup "$h" 12)"
+      else
+        # The cursor always lands on a line boundary (every writer sets it to a
+        # whole file size, and every log line ends in a newline). If it somehow
+        # exceeds the file, the log was truncated out from under us and the
+        # offset means nothing — replay the lot rather than lose it.
+        [ "$off" -gt "$size" ] && off=0
+        out="$(tail -c "+$((off+1))" "$LOG" 2>/dev/null | "$SELF_DIR/bus-filter" "$h")"
+      fi
+    fi
+    # Deliberately uncapped. The old 40-line clip silently ate the overflow on a
+    # busy day, which is precisely the failure a cursor exists to remove.
+    if [ -n "$out" ]; then printf '%s\n' "$out"; else echo "(nothing new)"; fi
+    cursor_set "$h" "$size"
     ;;
   log)
     tail -n "${1:-80}" "$LOG"
@@ -184,10 +407,16 @@ case "$cmd" in
   *)
     cat >&2 <<'EOF'
 bus — local coordination for Claude Code sessions
-  bus join <handle>              register + print your Monitor listen command
+  bus join [handle]              register + print your Monitor listen command
+                                 (no handle => a slug of the current directory)
   bus send <from> @to [..] msg   post a message tagging recipient(s); @all = broadcast
-  bus who                        list registered handles
-  bus catchup <handle> [hours]   messages that tagged you in the last N hours (default 12)
+                                 (multi-line/large payloads auto-store as a blob)
+  bus put [file]                 store a payload (file or stdin); prints its blob key
+  bus get <key>                  print a stored payload
+  bus who                        list registered handles (reaps dead ones first)
+  bus prune                      drop handles whose process is gone; sweep old blobs
+  bus catchup <handle> [hours]   mentions you have not been shown yet (exact, via a
+                                 read cursor); pass N hours to override with a window
   bus log [N]                    tail the shared log for full context (default 80)
   bus leave <handle>             deregister
   bus leave --by-session <id>    deregister whatever that Claude session joined as (used by the SessionEnd hook)
