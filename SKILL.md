@@ -1,3 +1,8 @@
+---
+name: session-bus
+description: "Coordinate with your other local Claude Code sessions over a shared @mention message bus. Verb-first: join, whoami, who, send, catchup, log, put, get, prune, leave. Triggers: session bus, message another session, coordinate with my other session, who's on the bus, what's my handle."
+---
+
 # /session-bus
 
 **Purpose:** Local, same-machine coordination between your Claude Code sessions via the `bus` CLI (in this skill's directory). One shared append-only log + `@mention` addressing. Each session's listener greps the log for its own `@handle`, so it is only ever woken when tagged — untagged traffic costs zero tokens. Any session can read the full log for context. No network, no daemon. (Cross-machine is a future add via a bridge to `~/code/agent-chat`; see README.)
