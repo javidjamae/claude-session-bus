@@ -13,7 +13,7 @@ Claude Code's built-in multi-agent features (subagents, agent teams) coordinate 
 - **The trick:** each session's listener is `tail -F bus.log | grep '@yourhandle'`, so the OS filters at the pipe — a session is **only ever woken when actually tagged**. Untagged messages never reach it.
 - **Full context on demand.** Because it's one shared log, any session can `bus log` to read the whole thread, tagged or not.
 - **Any-to-any.** No hub, no daemon, no network. Just a file and `tail`/`grep`.
-- **Self-cleaning roster.** A `SessionEnd` hook deregisters a session when it ends, so `bus who` shows who's actually there.
+- **Self-cleaning roster.** A `SessionEnd` hook deregisters a session when it ends, and a pid liveness check reaps whatever the hook couldn't (`kill -9`, crashes) — so `bus who` shows who's actually there.
 
 ## Install
 
@@ -37,10 +37,9 @@ re-running is safe. It backs the file up to `settings.json.bak` first, and uses
 
 ## Auto-leave on session end
 
-Sessions used to linger in `bus who` forever, because nothing told the bus they
-were gone. Now `bus join` records the session's `$CLAUDE_CODE_SESSION_ID` next to
-the handle, and the `SessionEnd` hook runs `bus leave --by-session <id>` as the
-session shuts down.
+`bus join` records the session's `$CLAUDE_CODE_SESSION_ID` next to the handle, and
+a `SessionEnd` hook runs `bus leave --by-session <id>` as the session shuts down —
+so a handle deregisters itself instead of lingering in `bus who`.
 
 Keying on the session id — not the working directory — is what makes it safe:
 several sessions can be open in one repo (`@apb`, `@apb1`, `@apb2`), and only the
@@ -48,21 +47,152 @@ one that actually ended gets deregistered. When no session id is available the
 hook falls back to `--by-cwd`, which refuses to act if that directory is
 ambiguous rather than deregistering the wrong session.
 
-**It's best-effort.** `SessionEnd` doesn't fire on `SIGKILL`, a closed terminal
-window, or a crash, so a session can still leave a stale entry behind. That's why
-`bus who` keeps its `stale?` flags — they're the backstop, not redundant. Sessions
-that joined before this change (no recorded session id) are never auto-left.
+### One live session per handle
+
+A handle belongs to one running session at a time. `join` refuses a name that a
+live session already holds, and suggests the next free suffix:
+
+```bash
+./bus join apb
+# error: the handle @apb is taken — a live session holds it (pid 17542, /Users/me/code/autopilot-blog).
+#        Try @apb2 instead.
+```
+
+Sharing a name half-works, which is worse than not working: delivery ignores the
+roster (`bus-filter` matches the `@mention` in the log line), so **both** sessions
+wake on every message; they share one read cursor, so either can consume the
+other's `catchup`; and only the newcomer appears in `who`. Refusing is cheaper
+than explaining that.
+
+A restart under the same name is not a collision — the previous holder's row is
+already reaped by the time the check runs, so reclaiming your own handle stays
+silent. Neither is re-registering from the same session.
+
+Removal is session-keyed for the same reason. `bus leave <handle>` refuses when
+the row belongs to a different session, since that session is probably still
+listening and would be left receiving messages while invisible in `who`:
+
+```bash
+./bus leave mc            # error: @mc is registered to a different session (…), not this one.
+./bus leave --force mc    # deregister it anyway — how you reclaim a name
+```
+
+The check only applies when both sides identify themselves, so a row with no
+session id, or a call from a plain shell, stays freely removable for hand cleanup.
+`--by-cwd` — the hook's fallback when no session id is available — additionally
+keeps any row whose process is still alive, unless that process is the session
+currently ending.
+
+### What `SessionEnd` actually covers
+
+Measured on macOS with Claude Code 2.1.220 (`test/`-style probe: seed a roster row
+bound to a known `--session-id`, end the session that way, see whether the row
+survived):
+
+| how the session ends | `SessionEnd` fires? |
+| --- | --- |
+| normal exit (`/exit`, a finished `-p` run) | ✅ yes |
+| `SIGHUP` — closing the terminal window | ✅ yes |
+| `SIGINT` (Ctrl-C) / `SIGTERM` (`kill`) | ✅ yes |
+| `SIGKILL` (`kill -9`), power loss, crash | ❌ **no** |
+
+So the hook covers every *orderly* ending, including the closed window that looks
+like a hard kill. Only `SIGKILL` and crashes escape it — the process is destroyed
+without ever running its shutdown path, and no in-process hook can change that.
+
+### The `SIGKILL` backstop: `bus prune`
+
+For the endings a hook can't catch, `join` also records the **pid of the Claude
+Code process** that owns the session (plus its start time, so a recycled pid isn't
+mistaken for the same session). `bus prune` — which `bus who` and `bus join` run
+automatically — drops any row whose process is no longer in the process table:
+
+```bash
+./bus prune      # reaped: @apb2 (process gone)
+```
+
+This is a liveness *check*, not a timeout. A session that has been idle for two
+days is still listed as `process live`; a session killed ten seconds ago is gone.
+An activity-based TTL would have gotten both of those backwards.
+
+Rows with no recorded pid — joined from a plain shell, where there's no Claude
+Code process to walk up to — are left alone by that automatic reap: not being
+able to prove a session is alive isn't proof that it's dead, and `prune` runs
+unbidden inside every `who` and `join`, so it must not silently deregister a
+session it can't assess. Those rows fall back to the `stale?` heuristic in
+`bus who`, which infers liveness from the handle's last activity in the log.
+
+Nothing stops you removing them, though — the caution is about what happens
+*without* being asked:
+
+```bash
+./bus leave vid          # drop one row, no evidence required
+./bus prune --force      # also drop every row that recorded no pid
+```
+
+`--force` still spares rows whose process is provably alive; it only removes the
+judgement call. The log records which is which — `reaped: session process gone`
+versus `reaped: no pid recorded, dropped by --force` — so a forced sweep never
+reads later as though the process table had proven something.
 
 **Or use the CLI directly** (it's just `bus`):
 ```bash
 ./bus join alice          # registers + prints your Monitor listen command
 ./bus send alice @bob "want to pair on the payments PR?"
-./bus who                 # who's registered
+./bus who                 # who's registered (reaps handles whose process is gone)
+./bus prune               # just the reap (and a sweep of blobs older than 30d)
+./bus prune --force       # ...also drop rows that recorded no pid to check
 ./bus log                 # full shared log for context
-./bus catchup alice       # messages that tagged you in the last 12h (after a restart)
-./bus catchup alice 48    # ...or widen the window to N hours
+./bus catchup alice       # every mention you haven't been shown yet (after a restart)
+./bus catchup alice 48    # ...or override the cursor with a plain N-hour window
+./bus put ./diff.patch    # store a payload, print its key
+./bus get 20260805-120000-41337   # read a payload someone sent
 ./bus leave alice         # (the SessionEnd hook does this for you automatically)
+./bus leave --force alice # ...even if the row belongs to another session
 ```
+
+## Catchup is a cursor, not a clock
+
+`catchup` answers "what did I miss while I was gone?" — exactly, with no window
+to tune and no cap on what it will show. Each handle carries a **read cursor**: a
+byte offset into the append-only log, in `~/.claude/session-bus/cursors/<handle>`.
+Catchup is then just "the rest of the file, filtered to my mentions."
+
+Two things advance the cursor:
+
+- **`catchup` itself**, once it has shown you the messages.
+- **A graceful leave.** Your listener is armed right up to the moment your session
+  ends, so everything logged before that was delivered live. The gap starts
+  exactly there, which is why the cursor is keyed on your session ending rather
+  than on a clock — a window can only guess at that boundary, and guesses wrong
+  in both directions.
+
+`prune` deliberately does *not* advance it when it reaps a `SIGKILL`ed session:
+nothing recorded when that session stopped reading, so its successor re-sees some
+already-delivered messages. That's the intended bias — every ambiguity here
+resolves toward showing a message twice rather than dropping it once. A brand-new
+handle gets its cursor seeded at join, so a first `catchup` shows nothing rather
+than the entire history; a handle with no cursor file falls back to a 12-hour
+window. Passing `[hours]` explicitly asks for that window instead.
+
+## Large and multi-line messages
+
+The log is one line per message, address field first — so a message body carrying
+a newline can't go in as-is: only its first line would have an address field, and
+`bus-filter` would drop the rest.
+
+`send` handles this for you. Anything multi-line, or over 800 bytes
+(`SESSION_BUS_INLINE_MAX`), is stored whole in `~/.claude/session-bus/blobs/`, and
+the log keeps a single greppable line:
+
+```
+[bob 08-05 12:21] @alice :: Here is the plan: … [blob 20260805-122145-15508: 4 lines, 65 bytes — read it with: bus get 20260805-122145-15508]
+```
+
+The recipient wakes on the `@mention`, sees what it's about, and pulls the full
+payload only if it wants it. `bus put [file]` stores a payload directly — useful
+when it's already on disk, or too big to pass as a shell argument. `bus prune`
+sweeps blobs older than 30 days (`SESSION_BUS_BLOB_DAYS`) and prints what it removed.
 
 ## Tests
 
@@ -75,11 +205,52 @@ touched:
 ```
 
 Covers stamp format, `send` validation, `bus-filter` addressing (direct /
-multi / `@all` / self-echo / `@mention`-in-body), `catchup` windowing, `who`
+multi / `@all` / self-echo / `@mention`-in-body), cursor-based `catchup` (seeded
+at join, advanced by a graceful leave, uncapped, exact across a multi-day gap)
+and its window fallback, blob offload of multi-line and oversized payloads
+(`put`/`get` round-trip, preview line, path-as-key rejection), `who`
 liveness flagging, session-id-keyed auto-leave (including the sibling-session and
-ambiguous-cwd cases), the `SessionEnd` hook, and the `install.sh` settings.json
+ambiguous-cwd cases), `prune`'s pid reaper (dead pid, recycled pid, silent-but-live
+session, pid-less row), `prune --force`, handle ownership (a taken name refused
+with a suffix suggestion, a restart still reclaiming its own name, and removal
+refusing to evict another session unless forced), the `SessionEnd` hook, and the `install.sh` settings.json
 merge — which runs against a throwaway `$HOME`, so your real settings are never
 touched either.
+
+## Why a file, and not a server?
+
+Most cross-session buses are built as a service: each session loads an MCP server
+(or connects to a daemon), registers an instance id, and sends to a named
+channel; a database holds the messages, and a session reads them by calling a
+`check_messages` tool or blocking on a `wait_for_reply` one. That works, but it
+pays for delivery in a way a file doesn't:
+
+- **Idle sessions cost nothing here.** A server-backed bus has to *tell* a
+  session it has mail, and MCP is request/response from the client side — so the
+  session either polls (`check_messages` every turn) or blocks waiting. Both burn
+  turns to learn that nothing happened. `tail -F | grep '@handle'` inverts it:
+  the kernel does the filtering, untagged traffic never reaches the session at
+  all, and a tagged message wakes it the moment it lands. Leaving four sessions
+  listening all day is free.
+- **One log beats N channels.** Channel- or mailbox-scoped buses fragment the
+  conversation: you only see what was addressed to you. Because everything lands
+  in one append-only file, `bus log` and `bus catchup` give any session the whole
+  cross-session thread — including the messages it was never tagged in. Wake-up
+  is filtered; *context* isn't.
+- **Nothing to install, nothing to run.** No Node, no daemon, no database, no
+  deploy. The transport is a file and two coreutils that are already on the
+  machine, which also means there's no server to be down and no state to get out
+  of sync with reality.
+- **The roster tells the truth.** Buses that track "online instances" usually
+  have no answer for a session that was `kill -9`'d. Here a `SessionEnd` hook
+  covers every orderly ending, and a pid + start-time liveness check reaps the
+  rest — so `bus who` reflects what's actually running, not what once registered.
+
+The honest trade: a file bus is **local and Claude-Code-shaped**. A networked bus
+reaches another machine today and talks to non-Claude clients over MCP or REST;
+`bus` does neither (cross-machine is on the roadmap below). If you need reach,
+take the server. If you want several long-lived sessions coordinating on one
+machine without paying to leave them listening, a file wins.
 
 ## Why not agent teams?
 

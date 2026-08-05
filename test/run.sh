@@ -89,6 +89,130 @@ assert_not_contains "own message dropped (self)"    "$c12" "my own message"
 assert_not_contains "body @mention dropped"         "$c12" "in body"
 c96="$("$BUS" catchup csb 96)"
 assert_contains     "wider window includes 48h line" "$c96" "old dated mention"
+assert_contains     "no-cursor handle falls back to the window" "$c12" "recent dated mention"
+
+# ---------------------------------------------------------------------------
+section "catchup read cursor"
+fresh
+"$BUS" send carol @alice "before alice ever joined" >/dev/null
+"$BUS" join alice >/dev/null 2>&1
+assert_contains "fresh join seeds cursor: no history dump" "$("$BUS" catchup alice)" "(nothing new)"
+"$BUS" send bob @alice "first unread" >/dev/null
+"$BUS" send bob @carol "not for alice" >/dev/null
+"$BUS" send bob @all   "broadcast unread" >/dev/null
+c="$("$BUS" catchup alice)"
+assert_contains     "cursor delivers the unread mention"  "$c" "first unread"
+assert_contains     "cursor delivers the unread @all"     "$c" "broadcast unread"
+assert_not_contains "cursor drops other people's mail"    "$c" "not for alice"
+assert_not_contains "cursor drops pre-join history"       "$c" "before alice ever joined"
+assert_contains     "catchup advances the cursor"         "$("$BUS" catchup alice)" "(nothing new)"
+
+# A graceful leave marks the log read, so the next session sees the gap and
+# only the gap — the whole point of keying on leave rather than on a clock.
+"$BUS" send bob @alice "seen live before leaving" >/dev/null
+"$BUS" leave alice >/dev/null
+"$BUS" send bob @alice "arrived while down" >/dev/null
+"$BUS" join alice >/dev/null 2>&1
+g="$("$BUS" catchup alice)"
+assert_contains     "gap after graceful leave delivered"  "$g" "arrived while down"
+assert_not_contains "pre-leave traffic not re-delivered"  "$g" "seen live before leaving"
+assert_not_contains "rejoin does not reset an existing cursor" "$g" "first unread"
+
+# The two failures the time window could not avoid.
+fresh
+"$BUS" join alice >/dev/null 2>&1; "$BUS" leave alice >/dev/null
+LOGF "[bob $(ago 30)] @alice :: unread for 30 hours"
+assert_contains     "gap wider than the old 12h window survives" "$("$BUS" catchup alice)" "unread for 30 hours"
+fresh
+"$BUS" join alice >/dev/null 2>&1; "$BUS" leave alice >/dev/null
+i=1; while [ "$i" -le 60 ]; do "$BUS" send bob @alice "msg $i" >/dev/null; i=$((i+1)); done
+assert_eq "60 unread messages, none clipped" "$("$BUS" catchup alice | grep -c 'msg ')" "60"
+# A truncated log makes every offset meaningless; replay beats losing them.
+: > "$SESSION_BUS_DIR/bus.log"
+"$BUS" send bob @alice "after truncation" >/dev/null
+assert_contains "log truncated under us -> replay, not silence" "$("$BUS" catchup alice)" "after truncation"
+
+# ---------------------------------------------------------------------------
+section "blob offload for large/multi-line payloads"
+fresh
+"$BUS" join alice >/dev/null 2>&1; "$BUS" leave alice >/dev/null
+"$BUS" send bob @alice "$(printf 'plan header\nstep one\nstep two')" >/dev/null
+assert_eq "multi-line send writes exactly one log line" \
+  "$(grep -c '@alice ::' "$SESSION_BUS_DIR/bus.log")" "1"
+line="$(grep '@alice ::' "$SESSION_BUS_DIR/bus.log")"
+assert_contains "log keeps a readable preview"   "$line" "plan header"
+assert_not_contains "body lines are not in the log" "$line" "step two"
+assert_match    "log carries the blob key"       "$line" '\[blob [0-9]{8}-[0-9]{6}-[0-9]+: 3 lines'
+assert_contains "recipient is still woken"       "$("$BUS" catchup alice)" "plan header"
+key="$(printf '%s' "$line" | sed -n 's/.*\[blob \([0-9-]*\):.*/\1/p')"
+assert_eq       "bus get returns the payload intact" "$("$BUS" get "$key")" "$(printf 'plan header\nstep one\nstep two')"
+big="$(head -c 900 /dev/zero | tr '\0' 'x')"
+"$BUS" send bob @alice "$big" >/dev/null
+assert_contains "oversized single line offloads too" "$(grep -c 'blob ' "$SESSION_BUS_DIR/bus.log")" "2"
+"$BUS" send bob @alice "short and single-line" >/dev/null
+assert_not_contains "small message stays inline" "$(tail -1 "$SESSION_BUS_DIR/bus.log")" "blob "
+k2="$(printf 'from stdin\nsecond line\n' | "$BUS" put)"
+assert_eq       "put via stdin round-trips" "$("$BUS" get "$k2")" "$(printf 'from stdin\nsecond line')"
+assert_contains "get rejects a path as a key" "$("$BUS" get ../../etc/passwd 2>&1)" "bad blob key"
+assert_contains "get reports a missing blob"  "$("$BUS" get no-such-key 2>&1)" "no such blob"
+
+# ---------------------------------------------------------------------------
+section "handle ownership (one live session per name)"
+dead_pid2() { ( exit 0 ) & p=$!; wait "$p" 2>/dev/null; printf '%s' "$p"; }
+livestart="$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
+LIVEROW() { printf '%s|%s|2026-08-05 13:00|%s|%s|%s\n' "$1" "${3:-/p}" "$2" "$$" "$livestart" >> "$SESSION_BUS_DIR/roster"; }
+
+fresh
+LIVEROW apb SID-X
+out="$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join apb 2>&1)"; rc=$?
+assert_eq       "join refuses a name a live session holds" "$rc" "1"
+assert_contains "refusal says the name is taken"           "$out" "@apb is taken"
+assert_contains "refusal suggests a free alternative"      "$out" "Try @apb2"
+assert_eq       "refused join did not touch the roster"    "$(grep -c '^apb|' "$SESSION_BUS_DIR/roster")" "1"
+assert_contains "holder's session id survives the attempt" "$(cat "$SESSION_BUS_DIR/roster")" "SID-X"
+LIVEROW apb2 SID-Y
+assert_contains "suffix suggestion skips taken names"      "$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join apb 2>&1)" "Try @apb3"
+
+# The normal restart: the previous holder's process is gone, so the name is free.
+fresh
+printf 'ugs|/p|2026-08-04 10:00|SID-OLD|%s|\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/roster"
+assert_contains "restart reclaims a name whose process died" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-NEW "$BUS" join ugs 2>&1)" "joined as 'ugs'"
+assert_contains "reclaimed row carries the new session id" "$(cat "$SESSION_BUS_DIR/roster")" "SID-NEW"
+fresh
+LIVEROW mc SID-A
+assert_contains "same session re-registering is not a collision" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" join mc 2>&1)" "joined as 'mc'"
+
+# Removal is session-keyed too, or a displaced session evicts the live holder.
+fresh
+LIVEROW mc SID-LIVE
+out="$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave mc 2>&1)"; rc=$?
+assert_eq       "another session cannot leave on your behalf"  "$rc" "1"
+assert_contains "refusal names the owning session"             "$out" "SID-LIVE"
+assert_contains "holder still registered after refused leave"  "$("$BUS" who)" "@mc"
+assert_contains "--force reclaims deliberately" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave --force mc 2>&1)" "left."
+fresh
+LIVEROW mc SID-LIVE
+assert_contains "the owner can always leave"      "$(CLAUDE_CODE_SESSION_ID=SID-LIVE "$BUS" leave mc 2>&1)" "left."
+fresh
+printf 'legacy|/p|2026-08-01 10:00|SID-GONE||\n' > "$SESSION_BUS_DIR/roster"
+assert_contains "hand cleanup from a plain shell still works" \
+  "$(env -u CLAUDE_CODE_SESSION_ID "$BUS" leave legacy 2>&1)" "left."
+
+# --by-cwd is a guess; it must not evict a row whose process is still running.
+fresh
+LIVEROW held SID-Z /p/x
+assert_contains "--by-cwd keeps a live row from another session" \
+  "$("$BUS" leave --by-cwd /p/x 2>&1)" "kept @held"
+assert_contains "kept row is still registered" "$("$BUS" who)" "@held"
+assert_contains "--by-cwd --force overrides the keep" \
+  "$("$BUS" leave --by-cwd --force /p/x 2>&1)" "left: @held"
+fresh
+printf 'goner|/p/x|2026-08-05 13:00|SID-G|%s|\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/roster"
+assert_contains "--by-cwd still removes a row whose process is gone" \
+  "$("$BUS" leave --by-cwd /p/x 2>&1)" "left: @goner"
 
 # ---------------------------------------------------------------------------
 section "who liveness"
@@ -114,13 +238,97 @@ assert_contains     "empty roster message"            "$("$BUS" who)" "nobody re
 section "join records session id"
 fresh
 CLAUDE_CODE_SESSION_ID=sess-aaa "$BUS" join alice >/dev/null
-assert_match "roster line is handle|cwd|joined|session_id" \
-  "$(grep '^alice|' "$SESSION_BUS_DIR/roster")" '^alice\|.*\|.*\|sess-aaa$'
+assert_match "roster line is handle|cwd|joined|session_id|pid|pstart" \
+  "$(grep '^alice|' "$SESSION_BUS_DIR/roster")" '^alice\|.*\|.*\|sess-aaa\|'
 out="$(env -u CLAUDE_CODE_SESSION_ID "$BUS" join bob 2>&1 >/dev/null)"
 assert_contains "warns when session id unavailable" "$out" "auto-leave"
 w="$("$BUS" who)"
 assert_contains "who still lists a 4-field entry" "$w" "@alice"
 assert_not_contains "who does not leak session id into the path column" "$w" "sess-aaa"
+
+# ---------------------------------------------------------------------------
+section "join with no handle (dir slug)"
+fresh
+slug="$(printf '%s' "${PWD##*/}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')"
+out="$(CLAUDE_CODE_SESSION_ID=s1 "$BUS" join)"
+assert_contains "derives a handle from the project dir" "$out" "joined as '$slug'"
+out2="$(CLAUDE_CODE_SESSION_ID=s2 "$BUS" join)"
+assert_contains "second session in the same dir gets a suffix" "$out2" "joined as '${slug}2'"
+w="$("$BUS" who)"
+assert_contains "first derived handle survives the second join" "$w" "@$slug "
+assert_contains "both derived handles registered" "$w" "@${slug}2"
+out3="$(CLAUDE_CODE_SESSION_ID=s1 "$BUS" join "$slug")"
+assert_contains "an explicit handle re-registers rather than suffixing" "$out3" "joined as '$slug'"
+assert_eq "explicit re-join does not add a row" \
+  "$(grep -c "^$slug|" "$SESSION_BUS_DIR/roster")" "1"
+
+# ---------------------------------------------------------------------------
+section "prune (hard-kill backstop)"
+# A pid that is guaranteed dead: spawn a trivial process and wait for it to exit.
+dead_pid() { ( exit 0 ) & p=$!; wait "$p" 2>/dev/null; printf '%s' "$p"; }
+ROW() { printf '%s|/p|2026-08-03 00:00|%s|%s|%s\n' "$1" "$2" "$3" "$4" >> "$SESSION_BUS_DIR/roster"; }
+mystart="$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
+
+fresh
+ROW ghost   sess-g "$(dead_pid)" ""            # process gone
+ROW livepid sess-l "$$"          "$mystart"    # this test process: alive, start matches
+ROW legacy  sess-x ""            ""            # no pid recorded: unjudgeable
+out="$("$BUS" prune)"
+assert_contains     "prune reports the reaped handle"   "$out" "reaped: @ghost"
+w="$("$BUS" who)"
+assert_not_contains "dead process's row removed"        "$w" "@ghost"
+assert_contains     "live process's row kept"           "$w" "@livepid"
+assert_contains     "live row shown as process live"    "$w" "process live"
+assert_contains     "pid-less row kept (not provably dead)" "$w" "@legacy"
+assert_contains     "reap is logged as offline"         "$(cat "$SESSION_BUS_DIR/bus.log")" "[ghost"
+assert_contains     "reap says why"                     "$(cat "$SESSION_BUS_DIR/bus.log")" "reaped"
+assert_contains     "nothing left to prune the 2nd time" "$("$BUS" prune)" "nothing to prune"
+
+# --force: the explicit "I know these are gone" sweep for pid-less rows. It is
+# never passed by the implicit prunes inside who/join.
+fresh
+ROW legacy2 sess-x2 ""    ""            # unjudgeable
+ROW alive2  sess-l2 "$$"  "$mystart"    # provably live
+assert_contains     "implicit prune (via who) keeps pid-less rows" "$("$BUS" who)" "@legacy2"
+f="$("$BUS" prune --force)"
+assert_contains     "--force reports the dropped row"   "$f" "reaped: @legacy2"
+w="$("$BUS" who)"
+assert_not_contains "--force drops the pid-less row"    "$w" "@legacy2"
+assert_contains     "--force still spares a live row"   "$w" "@alive2"
+assert_contains     "forced drop is logged as forced"   "$(cat "$SESSION_BUS_DIR/bus.log")" "dropped by --force"
+assert_not_contains "forced drop is not logged as proven-gone" \
+  "$(grep legacy2 "$SESSION_BUS_DIR/bus.log")" "session process gone"
+
+# pid reuse: same pid, different start time => the row's session is gone
+fresh
+ROW recycled sess-r "$$" "Mon Jan  1 00:00:00 2001"
+"$BUS" prune >/dev/null
+assert_not_contains "recycled pid is not mistaken for the same session" "$("$BUS" who)" "@recycled"
+
+# an idle-but-listening session must survive: no activity in the log at all
+fresh
+ROW quiet sess-q "$$" "$mystart"
+assert_contains "silent live session is never reaped" "$("$BUS" who)" "@quiet"
+
+# the reaper must not disturb the joining session's own state (it runs inside join)
+fresh
+ROW ghost4 sess-g4 "$(dead_pid)" ""
+CLAUDE_CODE_SESSION_ID=sess-keep "$BUS" join joiner >/dev/null 2>&1
+assert_match "join still records its own session id after reaping" \
+  "$(grep '^joiner|' "$SESSION_BUS_DIR/roster")" '^joiner\|.*\|.*\|sess-keep\|'
+assert_not_contains "reaping did not warn about a missing session id" \
+  "$(CLAUDE_CODE_SESSION_ID=sess-keep2 "$BUS" join joiner2 2>&1 >/dev/null)" "unset"
+
+# who reaps on its own, and join reaps too
+fresh
+ROW ghost2 sess-g2 "$(dead_pid)" ""
+assert_contains "who reaps and says so" "$("$BUS" who)" "reaped @ghost2"
+fresh
+ROW ghost3 sess-g3 "$(dead_pid)" ""
+CLAUDE_CODE_SESSION_ID=sess-new "$BUS" join newcomer >/dev/null
+w="$("$BUS" who)"
+assert_not_contains "join reaps dead rows"    "$w" "@ghost3"
+assert_contains     "join registers the newcomer" "$w" "@newcomer"
 
 # ---------------------------------------------------------------------------
 section "leave --by-session (the SessionEnd path)"

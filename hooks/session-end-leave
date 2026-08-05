@@ -10,8 +10,10 @@
 # several sessions share a cwd. If the payload has no session_id it falls back to
 # cwd, which `bus leave --by-cwd` refuses to act on when that cwd is ambiguous.
 #
-# Best-effort by nature: SessionEnd does NOT fire on SIGKILL, a closed terminal
-# window, or a crash. `bus who`'s "stale?" flags remain the backstop for those.
+# Measured coverage (macOS, Claude Code 2.1.220): SessionEnd fires on a normal
+# exit, on SIGINT (Ctrl-C), on SIGTERM, and on SIGHUP (closing the terminal
+# window) — but NOT on SIGKILL or a crash, where the process never runs its
+# shutdown path at all. `bus prune`'s pid check is the backstop for those.
 #
 # Fires for EVERY Claude Code session on the machine, so it must be a fast, quiet
 # no-op for sessions that never joined the bus — and must never fail the shutdown.
