@@ -1,0 +1,31 @@
+name: version-pr
+# Changesets in VERSION-ONLY mode: maintains a rolling "chore: version +
+# changelog" PR that accumulates .changeset/*.md notes from merged feature PRs.
+# Merging it bumps package.json + BUS_VERSION in `bus` (via
+# scripts/sync-version) and writes CHANGELOG.md — it does NOT release. The tag
+# stays behind the maintainer's explicit `gh release create` (docs/RELEASE.md).
+# Nothing is ever published to npm.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - uses: changesets/action@v1
+        with:
+          version: npm run version
+          commit: 'chore: version + changelog'
+          title: 'chore: version + changelog (merge when ready to stage a release)'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

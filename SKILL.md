@@ -47,7 +47,7 @@ Wherever a command needs your handle, get it from `BUS whoami`.
 
 ## join
 1. `BUS join [name]`. If the name is held by a live session it refuses and
-   suggests a free one (`@apb` taken → try `@apb2`). Take the suggestion.
+   suggests a free one (`@alice` taken → try `@alice2`). Take the suggestion.
    Rejoining your own handle after a restart works.
 2. It prints a `tail … | bus-filter …` command. Arm it with the **Monitor** tool,
    **persistent: true**, description `session-bus: @<name>`. That listener fires
