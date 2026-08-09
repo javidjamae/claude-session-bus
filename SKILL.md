@@ -34,6 +34,7 @@ rather than writing to the log yourself.
 | `prune [--force]` | `BUS prune [--force]` | drop dead rows; `--force` also drops pid-less ones |
 | `leave [--force]` | `BUS leave [--force] <yourhandle>` | **also TaskStop your Monitor** |
 | `listen-cmd` | `BUS listen-cmd <yourhandle>` | reprint the Monitor command |
+| `version` | `BUS version` | version + git commit of the code every session runs |
 | *(no args)* | `BUS whoami` then `BUS help` | status + what's available |
 
 The first word is always a command from this table. `/session-bus alice` is not a

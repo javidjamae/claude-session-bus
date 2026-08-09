@@ -35,6 +35,29 @@ re-running is safe. It backs the file up to `settings.json.bak` first, and uses
 ./install.sh --uninstall   # remove our hook (leaving others intact) + the symlink
 ```
 
+**Clone it somewhere permanent.** Both the skill symlink and the `SessionEnd`
+hook point at your checkout by absolute path — moving or deleting the clone
+silently breaks them. Re-run `./install.sh` after a move to re-point both.
+
+### Updating
+
+```bash
+git pull    # that's the whole update
+```
+
+No reinstall needed: the skill is a symlink and every `bus` command execs fresh
+from the checkout, so a pull reaches every session — including ones already
+running — on their next command. This also means **one machine runs one version**;
+there is no per-session copy to drift. `bus version` says which one.
+
+Two things do lag behind a pull, both runtime state rather than versions:
+
+- **Armed listeners.** A session's Monitor keeps the `bus-filter` process it
+  started with; it picks up filter changes when the listener is re-armed
+  (next `/session-bus join` — e.g. after a session restart).
+- **Loaded skill instructions.** A long-running session keeps the `SKILL.md` it
+  read until `/session-bus` is invoked again.
+
 ## Auto-leave on session end
 
 `bus join` records the session's `$CLAUDE_CODE_SESSION_ID` next to the handle, and

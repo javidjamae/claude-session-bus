@@ -7,6 +7,11 @@
 # context. See SKILL.md. No network, no daemon, no dependencies beyond coreutils.
 set -uo pipefail
 
+# Bumped on releases; `bus version` appends the git commit when run from a
+# checkout, which is the precise answer — the skill install is a symlink, so
+# whatever the checkout has IS what every session runs.
+BUS_VERSION="0.1.0"
+
 BUS_DIR="${SESSION_BUS_DIR:-$HOME/.claude/session-bus}"
 LOG="$BUS_DIR/bus.log"
 ROSTER="$BUS_DIR/roster"
@@ -273,6 +278,7 @@ bus — local coordination for Claude Code sessions
   bus leave --by-session <id>    deregister whatever that Claude session joined as (used by the SessionEnd hook)
   bus leave --by-cwd [--force] <path>
                                  deregister by working directory (refuses if >1 handle shares it)
+  bus version                    version + git commit of the code every session runs
 EOF
 }
 
@@ -538,6 +544,10 @@ case "$cmd" in
         echo "left."
         ;;
     esac
+    ;;
+  version)
+    sha="$(git -C "$SELF_DIR" rev-parse --short HEAD 2>/dev/null)"
+    printf 'bus %s%s\n' "$BUS_VERSION" "${sha:+ (git $sha)}"
     ;;
   help|-h|--help|'?')
     usage

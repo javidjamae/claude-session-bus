@@ -255,6 +255,15 @@ done
 assert_eq "help documents every subcommand" "${missing# }" ""
 
 # ---------------------------------------------------------------------------
+section "version"
+fresh
+v="$("$BUS" version)"
+assert_match "version prints 'bus <semver>'" "$v" '^bus [0-9]+\.[0-9]+\.[0-9]+'
+assert_contains "version appends the git commit when run from a checkout" "$v" "(git "
+"$BUS" version >/dev/null 2>&1
+assert_eq "version exits 0" "$?" "0"
+
+# ---------------------------------------------------------------------------
 section "whoami"
 fresh
 assert_contains "not joined -> says so"      "$("$BUS" whoami 2>&1)" "not on the bus"
