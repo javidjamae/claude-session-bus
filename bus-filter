@@ -11,6 +11,8 @@
 set -uo pipefail
 h="$(printf '%s' "${1:?usage: bus-filter <handle>}" | tr '[:upper:]' '[:lower:]')"
 exec awk -v h="$h" -F' :: ' '
-  { a = tolower($1) }                                              # $1 = address field (before " :: ")
-  a !~ ("^\\[" h " ") && a ~ ("@(" h "|all)([^0-9a-z_]|$)") { print; fflush() }
+  { a = tolower($1) }                       # $1 = "[sender ts] @to ..." (before " :: ")
+  a ~ ("^\\[@?" h " ") { next }             # no self-echo — senders log bare, but tolerate a leading @
+  { sub(/^\[[^]]*\][ \t]*/, "", a) }        # drop the [sender ts] block: a sender token is not an address
+  a ~ ("@(" h "|all)([^0-9a-z_]|$)") { print; fflush() }
 '

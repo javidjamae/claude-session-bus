@@ -53,6 +53,9 @@ fresh
 "$BUS" send bob "no at-sign here" >/dev/null 2>&1; assert_eq "missing recipient -> rc 1" "$?" "1"
 "$BUS" send bob @alice >/dev/null 2>&1;           assert_eq "empty message -> rc 1"    "$?" "1"
 "$BUS" send bob @alice "ok" >/dev/null 2>&1;      assert_eq "valid send -> rc 0"       "$?" "0"
+"$BUS" send @bob @alice "at-form sender" >/dev/null
+assert_match "sender's leading @ is stripped before logging" \
+  "$(grep ':: at-form sender' "$SESSION_BUS_DIR/bus.log")" '^\[bob '
 
 # ---------------------------------------------------------------------------
 section "bus-filter addressing"
@@ -70,6 +73,17 @@ assert_contains     "@all wakes anyone"            "$(printf '%s\n' "$bcast" | "
 assert_eq           "@all does NOT self-wake sender" "$(printf '%s\n' "$selfb" | "$FILTER" bob)" ""
 assert_eq           "@mention in body does not wake" "$(printf '%s\n' "$body"  | "$FILTER" bob)" ""
 
+# A sender logged in the @-form ('[@mc ' instead of '[mc ') must behave the same:
+# no self-echo, and the sender token must never match as if it were an address.
+atbcast='[@mc 08-03 01:00] @all :: mc broadcast'
+atdirect='[@mc 08-03 01:00] @bob :: mc direct to bob'
+assert_eq           "@-form sender: @all does not self-echo"     "$(printf '%s\n' "$atbcast"  | "$FILTER" mc)"    ""
+assert_eq           "@-form sender: direct-to-other no self-echo" "$(printf '%s\n' "$atdirect" | "$FILTER" mc)"   ""
+assert_contains     "@-form sender: @all still wakes others"     "$(printf '%s\n' "$atbcast"  | "$FILTER" bob)"   "mc broadcast"
+assert_contains     "@-form sender: direct still wakes recipient" "$(printf '%s\n' "$atdirect" | "$FILTER" bob)"  "mc direct to bob"
+assert_eq           "@-form sender token is not an address"      "$(printf '%s\n' "$atdirect" | "$FILTER" carol)" ""
+assert_contains     "bare-form other->mc still delivered"        "$(printf '%s\n' '[dave 08-03 01:00] @mc :: for mc' | "$FILTER" mc)" "for mc"
+
 # ---------------------------------------------------------------------------
 section "catchup time-window"
 fresh
@@ -79,6 +93,8 @@ LOGF "[dave $OUT] @csb :: old dated mention"
 LOGF "[dave 01:00] @csb :: legacy undated mention"
 LOGF "[dave $IN] @all :: recent broadcast"
 LOGF "[csb $IN] @all :: my own message"
+LOGF "[@csb $IN] @all :: my own @-form message"
+LOGF "[@dave $IN] @carol :: at-form sender not for csb"
 LOGF "[dave $IN] @carol :: hey @csb in body"
 c12="$("$BUS" catchup csb)"
 assert_contains     "in-window dated kept"          "$c12" "recent dated mention"
@@ -86,6 +102,8 @@ assert_contains     "in-window @all kept"           "$c12" "recent broadcast"
 assert_not_contains "out-of-window dated dropped"   "$c12" "old dated mention"
 assert_not_contains "undated legacy dropped"        "$c12" "legacy undated mention"
 assert_not_contains "own message dropped (self)"    "$c12" "my own message"
+assert_not_contains "own @-form message dropped"    "$c12" "my own @-form message"
+assert_not_contains "@-form sender token not treated as address" "$c12" "at-form sender not for csb"
 assert_not_contains "body @mention dropped"         "$c12" "in body"
 c96="$("$BUS" catchup csb 96)"
 assert_contains     "wider window includes 48h line" "$c96" "old dated mention"

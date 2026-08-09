@@ -232,7 +232,8 @@ row_alive() {
 window_catchup() {
   awk -v h="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" -v cut="$(now_minus_hours "$2")" -F' :: ' '
     { a = tolower($1) }
-    a ~ ("^\\[" h " ") { next }                              # drop self
+    a ~ ("^\\[@?" h " ") { next }                            # drop self (senders log bare, but tolerate a leading @)
+    { sub(/^\[[^]]*\][ \t]*/, "", a) }                       # drop the [sender ts] block: a sender token is not an address
     a !~ ("@(" h "|all)([^0-9a-z_]|$)") { next }             # must tag h/all
     {
       split($1, p, " ")                                      # p[2]=MM-DD p[3]=HH:MM]
@@ -330,6 +331,7 @@ case "$cmd" in
     ;;
   send)
     from="${1:?usage: bus send <from> @to [@to2...] message}"; shift
+    from="${from#@}"   # whoami prints '@handle'; log lines carry the bare form, so normalize
     tos=""
     while [ $# -gt 0 ]; do case "$1" in @*) tos="$tos $1"; shift;; *) break;; esac; done
     [ -n "$tos" ] || { echo "error: no @recipient (e.g. bus send alice @bob \"hi\")" >&2; exit 1; }
@@ -418,7 +420,7 @@ case "$cmd" in
         ''|*[!0-9]*) ;;
         *) printf "  @%-10s %s (joined %s, process live — pid %s)\n" "$hh" "$pwd" "$joined" "$pid"; continue;;
       esac
-      last="$(grep -iE "^\[$hh " "$LOG" 2>/dev/null | tail -1)"
+      last="$(grep -iE "^\[@?$hh " "$LOG" 2>/dev/null | tail -1)"
       seen=""; flag=""
       if [ -n "$last" ]; then
         # extract 'MM-DD HH:MM' from '[handle MM-DD HH:MM] ...'
