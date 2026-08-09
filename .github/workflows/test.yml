@@ -1,0 +1,27 @@
+name: test
+# The full suite on every PR and every push to main. Free on a public repo, and
+# the matrix earns its keep: the code carries BSD/GNU fallbacks (`date -v` vs
+# `date -d`, `ps -o lstart=`), so a single OS would let half of each fallback rot
+# untested.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # e2e clones this checkout and resolves a sha
+      - name: bus version
+        run: ./bus version
+      - name: unit suite
+        run: ./test/run.sh
+      - name: e2e battery (real listener pipeline, fresh clone)
+        run: ./test/e2e.sh
