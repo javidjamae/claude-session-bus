@@ -1,0 +1,35 @@
+name: test
+# Everything, everywhere: every PR, every push to main, and every release tag.
+# Standard runners are free on a public repo, so there is no reason to ration
+# runs — a suite that only runs at some moments trains you to trust the moments
+# it skipped. The matrix earns its keep too: the code carries BSD/GNU fallbacks
+# (`date -v` vs `date -d`, `ps -o lstart=`), so a single OS would let half of
+# each fallback rot untested.
+#
+# The tag trigger is not redundant with the main-branch run. It attaches a green
+# run to the tagged commit itself, which is the artifact a user actually
+# installs, and it is the only run that exists if a tag is ever cut from
+# somewhere other than a merge.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # e2e clones this checkout and resolves a sha
+      - name: bus version
+        run: ./bus version
+      - name: unit suite
+        run: ./test/run.sh
+      - name: e2e battery (real listener pipeline, fresh clone)
+        run: ./test/e2e.sh
