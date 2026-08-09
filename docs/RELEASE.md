@@ -19,6 +19,11 @@ packaging lands; the flow below is already shaped for it.
    seen it work — and `test.yml` is green on both Linux and macOS. The matrix is
    not ceremony: the code carries BSD/GNU fallbacks, so one OS only ever proves
    half of each. Never release off a red or skipped run.
+
+   CI runs on every PR, every push to main, and every `v*` tag. Standard runners
+   are free on a public repo, so nothing here is rationed — if you find yourself
+   reasoning about which runs to skip, that reasoning belongs to a private repo's
+   billing, not to this one.
 2. **Only the maintainer ships.** Agent sessions must never run
    `gh release create` (or push tags) on their own initiative or on an ambiguous
    instruction. An agent may propose a release; the maintainer cuts it, or gives
