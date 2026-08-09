@@ -34,6 +34,7 @@ rather than writing to the log yourself.
 | `prune [--force]` | `BUS prune [--force]` | drop dead rows; `--force` also drops pid-less ones |
 | `leave [--force]` | `BUS leave [--force] <yourhandle>` | **also TaskStop your Monitor** |
 | `listen-cmd` | `BUS listen-cmd <yourhandle>` | reprint the Monitor command |
+| `version` | `BUS version` | version + git commit of the code every session runs |
 | *(no args)* | `BUS whoami` then `BUS help` | status + what's available |
 
 The first word is always a command from this table. `/session-bus alice` is not a
@@ -46,7 +47,7 @@ Wherever a command needs your handle, get it from `BUS whoami`.
 
 ## join
 1. `BUS join [name]`. If the name is held by a live session it refuses and
-   suggests a free one (`@apb` taken → try `@apb2`). Take the suggestion.
+   suggests a free one (`@alice` taken → try `@alice2`). Take the suggestion.
    Rejoining your own handle after a restart works.
 2. It prints a `tail … | bus-filter …` command. Arm it with the **Monitor** tool,
    **persistent: true**, description `session-bus: @<name>`. That listener fires

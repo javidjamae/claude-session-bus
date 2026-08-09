@@ -1,0 +1,12 @@
+{
+  "name": "claude-session-bus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dev tooling only — the bus itself is bash + coreutils and never touches node. This exists so changesets can manage the version + CHANGELOG.",
+  "scripts": {
+    "version": "changeset version && ./scripts/sync-version"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.0"
+  }
+}
