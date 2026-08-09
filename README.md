@@ -42,7 +42,7 @@ a `SessionEnd` hook runs `bus leave --by-session <id>` as the session shuts down
 so a handle deregisters itself instead of lingering in `bus who`.
 
 Keying on the session id — not the working directory — is what makes it safe:
-several sessions can be open in one repo (`@apb`, `@apb1`, `@apb2`), and only the
+several sessions can be open in one repo (`@alice`, `@alice1`, `@alice2`), and only the
 one that actually ended gets deregistered. When no session id is available the
 hook falls back to `--by-cwd`, which refuses to act if that directory is
 ambiguous rather than deregistering the wrong session.
@@ -53,9 +53,9 @@ A handle belongs to one running session at a time. `join` refuses a name that a
 live session already holds, and suggests the next free suffix:
 
 ```bash
-./bus join apb
-# error: the handle @apb is taken — a live session holds it (pid 17542, /Users/me/code/autopilot-blog).
-#        Try @apb2 instead.
+./bus join alice
+# error: the handle @alice is taken — a live session holds it (pid 17542, /Users/me/code/web-app).
+#        Try @alice2 instead.
 ```
 
 Sharing a name half-works, which is worse than not working: delivery ignores the
@@ -73,8 +73,8 @@ the row belongs to a different session, since that session is probably still
 listening and would be left receiving messages while invisible in `who`:
 
 ```bash
-./bus leave mc            # error: @mc is registered to a different session (…), not this one.
-./bus leave --force mc    # deregister it anyway — how you reclaim a name
+./bus leave bob            # error: @bob is registered to a different session (…), not this one.
+./bus leave --force bob    # deregister it anyway — how you reclaim a name
 ```
 
 The check only applies when both sides identify themselves, so a row with no
@@ -108,7 +108,7 @@ mistaken for the same session). `bus prune` — which `bus who` and `bus join` r
 automatically — drops any row whose process is no longer in the process table:
 
 ```bash
-./bus prune      # reaped: @apb2 (process gone)
+./bus prune      # reaped: @alice2 (process gone)
 ```
 
 This is a liveness *check*, not a timeout. A session that has been idle for two
@@ -126,7 +126,7 @@ Nothing stops you removing them, though — the caution is about what happens
 *without* being asked:
 
 ```bash
-./bus leave vid          # drop one row, no evidence required
+./bus leave dave          # drop one row, no evidence required
 ./bus prune --force      # also drop every row that recorded no pid
 ```
 

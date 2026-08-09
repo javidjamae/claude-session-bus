@@ -73,39 +73,39 @@ assert_contains     "@all wakes anyone"            "$(printf '%s\n' "$bcast" | "
 assert_eq           "@all does NOT self-wake sender" "$(printf '%s\n' "$selfb" | "$FILTER" bob)" ""
 assert_eq           "@mention in body does not wake" "$(printf '%s\n' "$body"  | "$FILTER" bob)" ""
 
-# A sender logged in the @-form ('[@mc ' instead of '[mc ') must behave the same:
+# A sender logged in the @-form ('[@alice ' instead of '[alice ') must behave the same:
 # no self-echo, and the sender token must never match as if it were an address.
-atbcast='[@mc 08-03 01:00] @all :: mc broadcast'
-atdirect='[@mc 08-03 01:00] @bob :: mc direct to bob'
-assert_eq           "@-form sender: @all does not self-echo"     "$(printf '%s\n' "$atbcast"  | "$FILTER" mc)"    ""
-assert_eq           "@-form sender: direct-to-other no self-echo" "$(printf '%s\n' "$atdirect" | "$FILTER" mc)"   ""
-assert_contains     "@-form sender: @all still wakes others"     "$(printf '%s\n' "$atbcast"  | "$FILTER" bob)"   "mc broadcast"
-assert_contains     "@-form sender: direct still wakes recipient" "$(printf '%s\n' "$atdirect" | "$FILTER" bob)"  "mc direct to bob"
+atbcast='[@alice 08-03 01:00] @all :: alice broadcast'
+atdirect='[@alice 08-03 01:00] @bob :: alice direct to bob'
+assert_eq           "@-form sender: @all does not self-echo"     "$(printf '%s\n' "$atbcast"  | "$FILTER" alice)"    ""
+assert_eq           "@-form sender: direct-to-other no self-echo" "$(printf '%s\n' "$atdirect" | "$FILTER" alice)"   ""
+assert_contains     "@-form sender: @all still wakes others"     "$(printf '%s\n' "$atbcast"  | "$FILTER" bob)"   "alice broadcast"
+assert_contains     "@-form sender: direct still wakes recipient" "$(printf '%s\n' "$atdirect" | "$FILTER" bob)"  "alice direct to bob"
 assert_eq           "@-form sender token is not an address"      "$(printf '%s\n' "$atdirect" | "$FILTER" carol)" ""
-assert_contains     "bare-form other->mc still delivered"        "$(printf '%s\n' '[dave 08-03 01:00] @mc :: for mc' | "$FILTER" mc)" "for mc"
+assert_contains     "bare-form other->alice still delivered"        "$(printf '%s\n' '[dave 08-03 01:00] @alice :: for alice' | "$FILTER" alice)" "for alice"
 
 # ---------------------------------------------------------------------------
 section "catchup time-window"
 fresh
 IN="$(ago 2)"; OUT="$(ago 48)"
-LOGF "[dave $IN] @csb :: recent dated mention"
-LOGF "[dave $OUT] @csb :: old dated mention"
-LOGF "[dave 01:00] @csb :: legacy undated mention"
+LOGF "[dave $IN] @alice :: recent dated mention"
+LOGF "[dave $OUT] @alice :: old dated mention"
+LOGF "[dave 01:00] @alice :: legacy undated mention"
 LOGF "[dave $IN] @all :: recent broadcast"
-LOGF "[csb $IN] @all :: my own message"
-LOGF "[@csb $IN] @all :: my own @-form message"
-LOGF "[@dave $IN] @carol :: at-form sender not for csb"
-LOGF "[dave $IN] @carol :: hey @csb in body"
-c12="$("$BUS" catchup csb)"
+LOGF "[alice $IN] @all :: my own message"
+LOGF "[@alice $IN] @all :: my own @-form message"
+LOGF "[@dave $IN] @carol :: at-form sender not for alice"
+LOGF "[dave $IN] @carol :: hey @alice in body"
+c12="$("$BUS" catchup alice)"
 assert_contains     "in-window dated kept"          "$c12" "recent dated mention"
 assert_contains     "in-window @all kept"           "$c12" "recent broadcast"
 assert_not_contains "out-of-window dated dropped"   "$c12" "old dated mention"
 assert_not_contains "undated legacy dropped"        "$c12" "legacy undated mention"
 assert_not_contains "own message dropped (self)"    "$c12" "my own message"
 assert_not_contains "own @-form message dropped"    "$c12" "my own @-form message"
-assert_not_contains "@-form sender token not treated as address" "$c12" "at-form sender not for csb"
+assert_not_contains "@-form sender token not treated as address" "$c12" "at-form sender not for alice"
 assert_not_contains "body @mention dropped"         "$c12" "in body"
-c96="$("$BUS" catchup csb 96)"
+c96="$("$BUS" catchup alice 96)"
 assert_contains     "wider window includes 48h line" "$c96" "old dated mention"
 assert_contains     "no-cursor handle falls back to the window" "$c12" "recent dated mention"
 
@@ -181,39 +181,39 @@ livestart="$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
 LIVEROW() { printf '%s|%s|2026-08-05 13:00|%s|%s|%s\n' "$1" "${3:-/p}" "$2" "$$" "$livestart" >> "$SESSION_BUS_DIR/roster"; }
 
 fresh
-LIVEROW apb SID-X
-out="$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join apb 2>&1)"; rc=$?
+LIVEROW alice SID-X
+out="$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join alice 2>&1)"; rc=$?
 assert_eq       "join refuses a name a live session holds" "$rc" "1"
-assert_contains "refusal says the name is taken"           "$out" "@apb is taken"
-assert_contains "refusal suggests a free alternative"      "$out" "Try @apb2"
-assert_eq       "refused join did not touch the roster"    "$(grep -c '^apb|' "$SESSION_BUS_DIR/roster")" "1"
+assert_contains "refusal says the name is taken"           "$out" "@alice is taken"
+assert_contains "refusal suggests a free alternative"      "$out" "Try @alice2"
+assert_eq       "refused join did not touch the roster"    "$(grep -c '^alice|' "$SESSION_BUS_DIR/roster")" "1"
 assert_contains "holder's session id survives the attempt" "$(cat "$SESSION_BUS_DIR/roster")" "SID-X"
-LIVEROW apb2 SID-Y
-assert_contains "suffix suggestion skips taken names"      "$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join apb 2>&1)" "Try @apb3"
+LIVEROW alice2 SID-Y
+assert_contains "suffix suggestion skips taken names"      "$(CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join alice 2>&1)" "Try @alice3"
 
 # The normal restart: the previous holder's process is gone, so the name is free.
 fresh
-printf 'ugs|/p|2026-08-04 10:00|SID-OLD|%s|\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/roster"
+printf 'carol|/p|2026-08-04 10:00|SID-OLD|%s|\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/roster"
 assert_contains "restart reclaims a name whose process died" \
-  "$(CLAUDE_CODE_SESSION_ID=SID-NEW "$BUS" join ugs 2>&1)" "joined as 'ugs'"
+  "$(CLAUDE_CODE_SESSION_ID=SID-NEW "$BUS" join carol 2>&1)" "joined as 'carol'"
 assert_contains "reclaimed row carries the new session id" "$(cat "$SESSION_BUS_DIR/roster")" "SID-NEW"
 fresh
-LIVEROW mc SID-A
+LIVEROW bob SID-A
 assert_contains "same session re-registering is not a collision" \
-  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" join mc 2>&1)" "joined as 'mc'"
+  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" join bob 2>&1)" "joined as 'bob'"
 
 # Removal is session-keyed too, or a displaced session evicts the live holder.
 fresh
-LIVEROW mc SID-LIVE
-out="$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave mc 2>&1)"; rc=$?
+LIVEROW bob SID-LIVE
+out="$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave bob 2>&1)"; rc=$?
 assert_eq       "another session cannot leave on your behalf"  "$rc" "1"
 assert_contains "refusal names the owning session"             "$out" "SID-LIVE"
-assert_contains "holder still registered after refused leave"  "$("$BUS" who)" "@mc"
+assert_contains "holder still registered after refused leave"  "$("$BUS" who)" "@bob"
 assert_contains "--force reclaims deliberately" \
-  "$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave --force mc 2>&1)" "left."
+  "$(CLAUDE_CODE_SESSION_ID=SID-OTHER "$BUS" leave --force bob 2>&1)" "left."
 fresh
-LIVEROW mc SID-LIVE
-assert_contains "the owner can always leave"      "$(CLAUDE_CODE_SESSION_ID=SID-LIVE "$BUS" leave mc 2>&1)" "left."
+LIVEROW bob SID-LIVE
+assert_contains "the owner can always leave"      "$(CLAUDE_CODE_SESSION_ID=SID-LIVE "$BUS" leave bob 2>&1)" "left."
 fresh
 printf 'legacy|/p|2026-08-01 10:00|SID-GONE||\n' > "$SESSION_BUS_DIR/roster"
 assert_contains "hand cleanup from a plain shell still works" \
@@ -401,17 +401,17 @@ assert_contains     "join registers the newcomer" "$w" "@newcomer"
 section "leave --by-session (the SessionEnd path)"
 fresh
 # two sessions, same cwd, different handles — the case cwd alone can't resolve
-CLAUDE_CODE_SESSION_ID=sess-1 "$BUS" join apb1 >/dev/null
-CLAUDE_CODE_SESSION_ID=sess-2 "$BUS" join apb2 >/dev/null
+CLAUDE_CODE_SESSION_ID=sess-1 "$BUS" join alice1 >/dev/null
+CLAUDE_CODE_SESSION_ID=sess-2 "$BUS" join alice2 >/dev/null
 "$BUS" leave --by-session sess-1 >/dev/null
 w="$("$BUS" who)"
-assert_not_contains "ending session's handle removed"  "$w" "@apb1"
-assert_contains     "sibling session untouched"        "$w" "@apb2"
+assert_not_contains "ending session's handle removed"  "$w" "@alice1"
+assert_contains     "sibling session untouched"        "$w" "@alice2"
 assert_contains     "offline logged for the one that left" \
-  "$(grep 'offline' "$SESSION_BUS_DIR/bus.log")" "[apb1"
+  "$(grep 'offline' "$SESSION_BUS_DIR/bus.log")" "[alice1"
 "$BUS" leave --by-session sess-unknown >/dev/null 2>&1
 assert_eq "unknown session -> rc 0 (never blocks shutdown)" "$?" "0"
-assert_contains "unknown session leaves roster alone" "$("$BUS" who)" "@apb2"
+assert_contains "unknown session leaves roster alone" "$("$BUS" who)" "@alice2"
 printf 'legacy|/p|2026-08-03 00:00\n' > "$SESSION_BUS_DIR/roster"
 "$BUS" leave --by-session "" >/dev/null 2>&1
 assert_contains "empty session id never matches legacy 3-field rows" "$("$BUS" who)" "@legacy"
