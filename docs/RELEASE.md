@@ -24,10 +24,11 @@ packaging lands; the flow below is already shaped for it.
    are free on a public repo, so nothing here is rationed — if you find yourself
    reasoning about which runs to skip, that reasoning belongs to a private repo's
    billing, not to this one.
-2. **Only the maintainer ships.** Agent sessions must never run
-   `gh release create` (or push tags) on their own initiative or on an ambiguous
-   instruction. An agent may propose a release; the maintainer cuts it, or gives
-   an explicit "ship it" for THAT build.
+2. **The maintainer authorizes; the agent executes.** An agent may run the
+   release — that is the point of having one — but only on an explicit
+   authorizing utterance, never on its own initiative and never on an inference.
+   See [Authorization](#authorization) for the literal phrases and, just as
+   importantly, the literal non-phrases.
 3. **Work lands via branch + PR.** The maintainer merges the PR (code-review
    gate), then separately cuts the release. A merge is never a release.
 4. **Changesets carry the notes and the bump.** Every behavior-changing PR
@@ -83,9 +84,9 @@ Each step is a checkpoint, and they are deliberately not collapsible:
   a green pipeline is not approval to release. Only an explicit "ship it / cut
   the release" naming this build counts, and it does not carry over to the next
   one.
-- **Step 5 is the maintainer's own keystroke.** An agent may prepare everything
-  up to it — draft notes, confirm CI, state the exact command — and must stop
-  there.
+- **Step 5 runs on the authorizing phrase, not before it.** The agent executes
+  the release; what it may never do is decide that the moment has arrived. See
+  [Authorization](#authorization).
 
 Two checks around step 2 that are easy to skip and expensive to miss:
 
@@ -101,6 +102,68 @@ Two checks around step 2 that are easy to skip and expensive to miss:
 The tag goes on the merge commit of the version PR, so `bus version` inside the
 tagged tree agrees with the tag. `--generate-notes` is fine; pasting the new
 CHANGELOG section into `--notes-file` is nicer.
+
+## Authorization
+
+A release is authorized by an **imperative naming the act**, from the
+maintainer, in their own words:
+
+> "release approved" · "ship it" · "cut the release" · "tag it"
+
+These are **not** authorization, and an agent that treats any of them as
+authorization has released without permission:
+
+> "merge it" · "merged" · "looks good" · "build it" · "get it in" · "ready to
+> ship?" · a merged PR · a merged version PR · green CI · a previous release's
+> approval
+
+Two forms deserve their own line, because they are the ones that actually get
+misread:
+
+- **A question is not an approval.** "should we ship it?" asks for a
+  recommendation. Answer it, then wait for the imperative.
+- **Merging is not approving.** The whole point of two gates is that the
+  maintainer merges far more often than they release. An agent that infers
+  "merged, therefore ship" has collapsed the gates that exist to be separate.
+
+**An approval binds one act, one version, one commit.** If the tree moves
+between the utterance and the execution, the approval is void — stop, say so,
+and ask again. Conditional forward authorization ("ship it once CI is green") is
+honored only for the condition actually stated.
+
+**Approval does not outrank the gate.** If the gate goes red after approval,
+nothing ships: stop, report, fix through its own PR, and ask for a fresh
+authorization. An approval is permission to release a *verified* build, not an
+instruction to release whatever is there.
+
+**If you cannot quote the utterance, you did not have it.** The completion
+report names it.
+
+## Executing an approved release
+
+On the authorizing phrase, in this order:
+
+1. **Pin the commit.** Sync, resolve the exact sha, and use it explicitly for
+   everything below. Never release "whatever main is now" — main can move
+   between the utterance and the tag.
+2. **Confirm the version is staged.** `package.json` and `BUS_VERSION` agree,
+   `CHANGELOG.md` has the entry, and no `.changeset/*.md` remain pending.
+3. **Re-run the whole gate on that sha** — after approval, before anything
+   irreversible: `./test/run.sh`, then `./test/e2e.sh <sha>` from a fresh clone,
+   and CI green on that commit for both platforms. A red gate voids the
+   approval.
+4. **Create the release against the pinned sha**, with notes carrying the
+   changelog entry and the update-semantics line:
+   `gh release create vX.Y.Z --target <sha> --notes-file <file>`
+5. **Watch the tag build to completion.** The `v*` trigger runs the suites
+   against the tagged commit; a release whose own build is red is not done.
+6. **Confirm positively, from where a user stands.** Clone the tag fresh and
+   assert it reports the released version — `bus version` says `vX.Y.Z` — and run
+   one real behavior check. Success means an explicit match, never the absence
+   of an error: a check that passes by finding nothing must be able to fail.
+7. **Report** with the gate numbers on the released sha, the release URL, the
+   tag build result, the positive confirmation, the authorizing utterance, and
+   an explicit list of anything **not** verified.
 
 ### When something is wrong after the tag
 

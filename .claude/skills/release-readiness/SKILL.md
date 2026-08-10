@@ -1,6 +1,6 @@
 ---
 name: release-readiness
-description: "Assess whether this repo is merge-ready or release-ready, and prepare (never cut) a release. Triggers: is this merge-ready, can we ship, cut a release, tag a version, prepare the release, release checklist."
+description: "Assess whether this repo is merge-ready or release-ready, and execute a release once the maintainer authorizes it. Triggers: is this merge-ready, can we ship, release approved, ship it, cut the release, tag a version, release checklist."
 ---
 
 # release-readiness
@@ -56,16 +56,29 @@ Run through `docs/RELEASE.md` in order and report each step's state:
    safe to update while sessions are live, and why.
 5. State the exact command for the maintainer, and stop.
 
-## The hard stop
+## Authorization — the one thing you may not decide
 
-**Never run `gh release create`, never push a tag, never merge the version PR
-on your own initiative.** Approval means an explicit "ship it" or "cut the
-release" naming this build, from the maintainer, in their own words. A green
-pipeline, a merged PR, "looks good", or approval of an earlier release is not
-approval of this one — and approval does not carry to the next build.
+You execute the release. You never decide that the moment has come.
 
-Prepare everything, then hand over:
+**Authorizing** — an imperative naming the act, from the maintainer, in their
+own words: "release approved", "ship it", "cut the release", "tag it".
 
-```
-gh release create v<X.Y.Z> --generate-notes    # maintainer runs this
-```
+**Not authorizing** — "merge it", "merged", "looks good", "build it", "get it
+in", "ready to ship?", a merged PR, a merged version PR, green CI, or an earlier
+release's approval. A question asks for a recommendation: answer it and wait.
+
+One approval binds one act, one version, one commit. If the tree moves between
+the utterance and the execution, it is void — stop and ask again. If the gate
+goes red after approval, nothing ships: report, fix through its own PR, ask
+again. If you cannot quote the authorizing utterance, you did not have it.
+
+## On the phrase, execute
+
+Follow "Executing an approved release" in `docs/RELEASE.md` exactly: pin the
+sha, confirm the version is staged with no changesets pending, re-run the full
+gate **on that sha**, create the release against the pinned commit, watch the
+tag build, confirm positively from a fresh clone of the tag, and report — gate
+numbers, release URL, build result, the utterance, and what you did not verify.
+
+Never merge the version PR on your own initiative; that is a separate human
+checkpoint from the release itself.
