@@ -78,9 +78,16 @@ blob_sweep() {
   _days="${SESSION_BUS_BLOB_DAYS:-30}"
   [ -d "$BLOBS" ] || return 0
   _n=0
-  for _f in $(find "$BLOBS" -type f -mtime +"$_days" 2>/dev/null); do
+  # Read the list rather than word-splitting find's output: blob keys are
+  # generated and contain no spaces today, but a path that ever did would be
+  # split into pieces and quietly not deleted. The heredoc keeps the loop in
+  # this shell, so the count survives it.
+  while IFS= read -r _f; do
+    [ -n "$_f" ] || continue
     rm -f "$_f" 2>/dev/null && _n=$((_n+1))
-  done
+  done <<EOF
+$(find "$BLOBS" -type f -mtime +"$_days" 2>/dev/null)
+EOF
   [ "$_n" -gt 0 ] && printf '%s' "$_n"
   return 0
 }
@@ -420,6 +427,7 @@ case "$cmd" in
     # LAST activity in the log, flagging anything past the stale window.
     stale_hours=6
     stale_cut="$(now_minus_hours "$stale_hours")"
+    # shellcheck disable=SC2034  # pstart names the last field so read consumes it; who doesn't use it
     while IFS='|' read -r hh pwd joined sid pid pstart; do
       [ -n "$hh" ] || continue
       case "${pid:-}" in

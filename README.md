@@ -1,5 +1,11 @@
 # claude-session-bus
 
+[![test](https://github.com/javidjamae/claude-session-bus/actions/workflows/test.yml/badge.svg)](https://github.com/javidjamae/claude-session-bus/actions/workflows/test.yml)
+[![lint](https://github.com/javidjamae/claude-session-bus/actions/workflows/lint.yml/badge.svg)](https://github.com/javidjamae/claude-session-bus/actions/workflows/lint.yml)
+[![release](https://img.shields.io/github/v/release/javidjamae/claude-session-bus?label=release)](https://github.com/javidjamae/claude-session-bus/releases/latest)
+[![license](https://img.shields.io/github/license/javidjamae/claude-session-bus)](LICENSE)
+![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+
 Zero-config local coordination for [Claude Code](https://claude.com/claude-code) sessions. Open several `claude` sessions in different repos and let them message each other — **a session is only woken when it's `@mentioned`, so untagged traffic costs nothing.**
 
 ## The problem

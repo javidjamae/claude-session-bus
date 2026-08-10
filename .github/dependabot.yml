@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Action versions are the only pinned third-party thing here — the bus itself
+  # has no runtime dependencies. Monthly, because a repo this small does not
+  # need a weekly stream of bumps to read.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore"
+  # npm covers the dev-only changesets CLI. Grouped so a quiet month is one PR
+  # rather than several.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore"
+    groups:
+      dev-tooling:
+        patterns: ["*"]
