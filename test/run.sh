@@ -29,7 +29,7 @@ assert_eq()           { [ "$2" = "$3" ] && pass "$1" || fail "$1" "want [$3] got
 assert_match()        { printf '%s' "$2" | grep -qE "$3" && pass "$1" || fail "$1" "want-match /$3/ got [$2]"; }
 
 # fresh, isolated bus dir for the next block of assertions
-fresh() { export SESSION_BUS_DIR="$(mktemp -d "$TMP_ROOT/bus.XXXXXX")"; }
+fresh() { SESSION_BUS_DIR="$(mktemp -d "$TMP_ROOT/bus.XXXXXX")"; export SESSION_BUS_DIR; }
 LOGF()  { printf '%s\n' "$*" >> "$SESSION_BUS_DIR/bus.log"; }        # inject a raw log line
 ago()   { date -v-"$1"H '+%m-%d %H:%M' 2>/dev/null || date -d "-$1 hours" '+%m-%d %H:%M'; }
 
@@ -173,6 +173,24 @@ k2="$(printf 'from stdin\nsecond line\n' | "$BUS" put)"
 assert_eq       "put via stdin round-trips" "$("$BUS" get "$k2")" "$(printf 'from stdin\nsecond line')"
 assert_contains "get rejects a path as a key" "$("$BUS" get ../../etc/passwd 2>&1)" "bad blob key"
 assert_contains "get reports a missing blob"  "$("$BUS" get no-such-key 2>&1)" "no such blob"
+
+# The sweep: old blobs go, recent ones stay, and the COUNT has to survive the
+# loop that deletes them — it is reported to the user, and a loop that runs in a
+# subshell would report 0 while deleting everything.
+fresh
+old="$(printf 'stale payload\n' | "$BUS" put)"
+new="$(printf 'fresh payload\n' | "$BUS" put)"
+touch -t 202501010000 "$SESSION_BUS_DIR/blobs/$old"
+sw="$("$BUS" prune)"
+assert_contains     "prune sweeps a blob older than the window" "$sw" "swept: 1 blob"
+assert_contains     "swept blob is gone"        "$("$BUS" get "$old" 2>&1)" "no such blob"
+assert_eq           "recent blob is untouched"  "$("$BUS" get "$new")" "fresh payload"
+# A path with a space must be deleted, not word-split into pieces that survive.
+spaced="$SESSION_BUS_DIR/blobs/old key with spaces"
+printf 'spaced payload\n' > "$spaced"
+touch -t 202501010000 "$spaced"
+assert_contains     "sweep handles a blob path containing spaces" "$("$BUS" prune)" "swept: 1 blob"
+[ -e "$spaced" ] && fail "spaced blob actually deleted" "still on disk" || pass "spaced blob actually deleted"
 
 # ---------------------------------------------------------------------------
 section "handle ownership (one live session per name)"
