@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# sync-version — copy package.json's version into BUS_VERSION in ./bus.
+# sync-version — copy package.json's version into BUS_VERSION in ./bus, and
+# into package-lock.json's mirror of it.
 #
 # Changesets bumps package.json; the bus itself is bash and reads nothing at
 # runtime, so the version users see (`bus version`) is baked into the script.
 # This runs as part of `npm run version` (the changesets version PR), and the
 # test suite fails if the two ever drift.
+#
+# The lock carries its own copy of the project version and `changeset version`
+# does not touch it, so it had silently drifted three releases behind (0.1.0
+# while package.json said 0.3.0). `npm install --package-lock-only` refreshes
+# just that mirror — it resolves nothing new, because every dependency is
+# already pinned in the lock.
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 v="$(sed -n 's/^  "version": *"\([^"]*\)".*/\1/p' "$DIR/package.json" | head -1)"
@@ -13,3 +20,10 @@ sed -i.bak "s/^BUS_VERSION=\"[^\"]*\"/BUS_VERSION=\"$v\"/" "$DIR/bus"
 rm -f "$DIR/bus.bak"
 grep -q "^BUS_VERSION=\"$v\"" "$DIR/bus" || { echo "sync-version: BUS_VERSION line not found in bus" >&2; exit 1; }
 echo "BUS_VERSION -> $v"
+# Best-effort: a lock left one version behind is cosmetic, and must never fail
+# the version PR (the runner may have no registry access).
+if (cd "$DIR" && npm install --package-lock-only >/dev/null 2>&1); then
+  echo "package-lock.json -> $v"
+else
+  echo "sync-version: could not refresh package-lock.json (continuing)" >&2
+fi
