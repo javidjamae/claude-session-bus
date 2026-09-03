@@ -488,6 +488,18 @@ assert_eq "version exits 0" "$?" "0"
 pjv="$(sed -n 's/^  "version": *"\([^"]*\)".*/\1/p' "$REPO/package.json" | head -1)"
 busv="$(sed -n 's/^BUS_VERSION="\(.*\)"$/\1/p' "$REPO/bus")"
 assert_eq "BUS_VERSION matches package.json (run scripts/sync-version)" "$busv" "$pjv"
+# The lock keeps its own copy of the project version. Nothing breaks when it
+# drifts (npm ci only validates the dependency tree), which is exactly why it
+# went three releases unnoticed — so assert it.
+plv="$(sed -n 's/^  "version": *"\([^"]*\)".*/\1/p' "$REPO/package-lock.json" | head -1)"
+assert_eq "package-lock.json version matches package.json" "$plv" "$pjv"
+# changesets v3 skips PRIVATE packages unless told otherwise — and skips them
+# SILENTLY: `changeset version` exits 0 saying "All files have been updated"
+# while consuming no changeset and bumping nothing. This repo is private:true,
+# so without this config the whole release pipeline is a no-op that looks fine.
+# Caught by a smoke test after the v2->v3 bump; asserted here so it stays fixed.
+assert_eq "changesets is configured to version private packages" \
+  "$(node -e 'try{const c=require("'"$REPO"'/.changeset/config.json");console.log(c.privatePackages&&c.privatePackages.version===true?"yes":"no")}catch(e){console.log("unreadable")}' 2>/dev/null || echo skip)" "yes"
 
 # ---------------------------------------------------------------------------
 section "whoami"
