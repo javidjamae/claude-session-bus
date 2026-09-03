@@ -501,6 +501,28 @@ assert_eq "package-lock.json version matches package.json" "$plv" "$pjv"
 assert_eq "changesets is configured to version private packages" \
   "$(node -e 'try{const c=require("'"$REPO"'/.changeset/config.json");console.log(c.privatePackages&&c.privatePackages.version===true?"yes":"no")}catch(e){console.log("unreadable")}' 2>/dev/null || echo skip)" "yes"
 
+# The release job's own wiring. version-pr.yml only runs on push-to-main, so a
+# PR can never exercise it — it broke twice in one afternoon (changesets/action
+# v1->v2 renamed every input and hard-errors on the old ones) and both times the
+# failure landed on main before anyone could see it. These are static checks of
+# the file, which is the only tier that CAN catch it before the merge.
+VPR="$REPO/.github/workflows/version-pr.yml"
+# Only the changesets step's own `with:` block — the job is itself named
+# `version:`, so scanning the whole file would flag the job id as a v1 input.
+vpr_with="$(awk '/uses: changesets\/action/{f=1; next} f && /^ *env:/{f=0} f' "$VPR" 2>/dev/null)"
+for old in version commit title; do
+  assert_not_contains "version-pr.yml does not pass the v1 input '$old' (renamed in v2)" \
+    "$(printf '%s\n' "$vpr_with" | grep -E "^ +$old:" )" "$old:"
+done
+assert_contains "version-pr.yml passes version-script"  "$vpr_with" "version-script:"
+assert_contains "version-pr.yml passes commit-message"  "$vpr_with" "commit-message:"
+assert_contains "version-pr.yml passes pr-title"        "$vpr_with" "pr-title:"
+# Tag safety: both default to TRUE in changesets/action v2, and an automated tag
+# would break the one rule the release doc is built around — the maintainer cuts
+# the tag. Asserted so a future bump cannot quietly re-enable them.
+assert_contains "version-pr.yml never creates GitHub releases" "$(cat "$VPR")" "create-github-releases: false"
+assert_contains "version-pr.yml never pushes git tags"         "$(cat "$VPR")" "push-git-tags: false"
+
 # ---------------------------------------------------------------------------
 section "whoami"
 fresh
