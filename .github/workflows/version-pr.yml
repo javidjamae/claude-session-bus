@@ -24,8 +24,19 @@ jobs:
       - run: npm ci
       - uses: changesets/action@v2
         with:
-          version: npm run version
-          commit: 'chore: version + changelog'
-          title: 'chore: version + changelog (merge when ready to stage a release)'
+          # v2 renamed every one of these (version/commit/title in v1) and
+          # HARD-ERRORS on the old spellings rather than ignoring them, so the
+          # v1->v2 bump took the whole job down until this was updated.
+          version-script: npm run version
+          commit-message: 'chore: version + changelog'
+          pr-title: 'chore: version + changelog (merge when ready to stage a release)'
+          # Both default to TRUE in v2. Nothing here should ever create a
+          # release or push a tag: the tag is the release in this repo, and it
+          # is cut by hand by the maintainer (docs/RELEASE.md). These only fire
+          # in publish mode — which this job has no publish-script for — but
+          # they are pinned anyway, because the cost of being wrong is an
+          # automated tag on a build nobody authorized.
+          create-github-releases: false
+          push-git-tags: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
