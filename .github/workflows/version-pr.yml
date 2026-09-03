@@ -22,7 +22,7 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
-      - uses: changesets/action@v1
+      - uses: changesets/action@v2
         with:
           version: npm run version
           commit: 'chore: version + changelog'
