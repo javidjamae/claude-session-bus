@@ -17,7 +17,8 @@ LOG="$BUS_DIR/bus.log"
 ROSTER="$BUS_DIR/roster"
 CURSORS="$BUS_DIR/cursors"   # one file per handle: how far into bus.log it has read
 BLOBS="$BUS_DIR/blobs"       # payloads too big or too multi-line to inline in the log
-mkdir -p "$BUS_DIR" "$CURSORS" "$BLOBS"; : >>"$LOG"; : >>"$ROSTER"
+LISTENERS="$BUS_DIR/listeners"  # one lock per handle: who is tailing the log for it
+mkdir -p "$BUS_DIR" "$CURSORS" "$BLOBS" "$LISTENERS"; : >>"$LOG"; : >>"$ROSTER"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 # Timestamp for log lines. Dated so messages are unambiguous across days.
@@ -47,7 +48,8 @@ now_minus_hours() {
 
 log_size() { wc -c <"$LOG" 2>/dev/null | tr -d ' '; }
 
-cursor_file() { printf '%s/%s' "$CURSORS" "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-')"; }
+handle_slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-'; }
+cursor_file() { printf '%s/%s' "$CURSORS" "$(handle_slug "$1")"; }
 cursor_get()  { _cf="$(cursor_file "$1")"; [ -f "$_cf" ] || return 1; cat "$_cf" 2>/dev/null; }
 # Monotonic: a stale writer (an old session leaving late) must never rewind a
 # cursor that a live session has already advanced past.
@@ -85,12 +87,12 @@ blob_sweep() {
   return 0
 }
 
-# Print the exact Monitor listen command for a handle. Two guards prevent false wakes:
-#  1. Match @<handle>/@all only in the ADDRESS field (before the ' :: ' delimiter),
-#     so an @mention inside a message body never triggers a wake.
-#  2. Drop the session's OWN messages ('[<handle> …'), so you never wake on self-echo.
+# Print the exact Monitor listen command for a handle. `bus listen` runs the
+# tail|bus-filter pipeline (address-field matching, no self-echo) wrapped in a
+# duplicate-listener guard, so a session that forgets it is already listening
+# and arms a second Monitor gets an immediate refusal instead of double delivery.
 listen_cmd() {
-  printf "tail -F -n 0 %s | %s/bus-filter %s\n" "$LOG" "$SELF_DIR" "$1"
+  printf '%s/bus listen %s\n' "$SELF_DIR" "$1"
 }
 
 roster_drop() { grep -v -iE "^$1\\|" "$ROSTER" >"$ROSTER.tmp" 2>/dev/null; mv "$ROSTER.tmp" "$ROSTER" 2>/dev/null; return 0; }
@@ -226,6 +228,49 @@ row_alive() {
   [ -z "${_rs:-}" ] || [ "$_rc" = "$_rs" ]
 }
 
+# --- listener locks ---------------------------------------------------------
+# One live listener per session — enforced, not requested. A session that
+# forgets it is already listening and arms a second Monitor used to get every
+# message twice; now `bus listen` records who is tailing the log for each
+# handle, and a duplicate simply refuses to start. Lock line format:
+#   listener_pid|listener_pstart|claude_pid|claude_pstart|session_id|handle
+# The pid+start pairs make both identities provable against the process table:
+# a lock whose listener process is gone is stale and never blocks anyone.
+
+listener_file() { printf '%s/%s' "$LISTENERS" "$(handle_slug "$1")"; }
+
+# Do these two identities belong to the same Claude session? Session-id
+# evidence decides whenever both sides carry one — the id is what defines a
+# session, and it survives a resume. The owning-process pid only breaks the
+# tie when id evidence is missing (a plain-shell listener has neither).
+same_session() { # <their_sid> <their_cpid> <my_sid> <my_cpid>
+  if [ -n "${1:-}" ] && [ -n "${3:-}" ]; then [ "$1" = "$3" ]; return; fi
+  [ -n "${2:-}" ] && [ -n "${4:-}" ] && [ "$2" = "$4" ]
+}
+
+# Does THIS session already have a live listener for <handle>? Consulted by
+# join/whoami so their guidance never tells a listening session to arm a second
+# Monitor. An orphan — listener running but its session's process provably
+# gone — does not count as live: it is delivering to nobody, and the next
+# `bus listen` will replace it.
+listener_live_mine() { # <handle> <my_sid> <my_cpid>
+  _lm_f="$(listener_file "$1")"
+  [ -f "$_lm_f" ] || return 1
+  # shellcheck disable=SC2034  # _lm_h names the last field so read consumes it
+  IFS='|' read -r _lm_pid _lm_pstart _lm_cpid _lm_cstart _lm_sid _lm_h <"$_lm_f" 2>/dev/null
+  case "${_lm_pid:-}" in ''|*[!0-9]*) return 1;; esac
+  _lm_cur="$(proc_start "$_lm_pid")"
+  [ -n "$_lm_cur" ] || return 1
+  [ -z "${_lm_pstart:-}" ] || [ "$_lm_cur" = "$_lm_pstart" ] || return 1
+  case "${_lm_cpid:-}" in
+    ''|*[!0-9]*) ;;
+    *) _lm_oc="$(proc_start "$_lm_cpid")"
+       [ -n "$_lm_oc" ] || return 1
+       [ -z "${_lm_cstart:-}" ] || [ "$_lm_oc" = "$_lm_cstart" ] || return 1;;
+  esac
+  same_session "${_lm_sid:-}" "${_lm_cpid:-}" "${2:-}" "${3:-}"
+}
+
 # Time-windowed catchup: the fallback for handles with no cursor yet, and what
 # you get when you ask for a window explicitly. Keep only lines tagging @h/@all
 # (never self), then only lines newer than the cutoff. The timestamp is fields 2
@@ -272,6 +317,8 @@ bus — local coordination for Claude Code sessions
   bus get <key>                  print a stored payload
   bus prune [--force]            drop handles whose process is gone; sweep old blobs
                                  (--force also drops rows that recorded no pid)
+  bus listen <handle>            run the listener a Monitor arms (blocks; refuses to
+                                 start when this session already has a live listener)
   bus listen-cmd <handle>        reprint the Monitor listen command
   bus leave [--force] <handle>   deregister (--force: also when the row belongs to
                                  another session — e.g. reclaiming a taken name)
@@ -291,6 +338,31 @@ case "$cmd" in
     cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
     lock
     prune_dead >/dev/null               # joining is a good moment to reap dead rows
+    # What does this session already hold? Keyed on the session id when there is
+    # one (it is what defines a session, and it survives a resume), falling back
+    # to the owning process for plain-shell joins.
+    mine=""
+    if [ -n "$sid" ]; then
+      mine="$(handles_by_session "$sid")"
+    elif [ -n "$cpid" ]; then
+      mine="$(awk -F'|' -v p="$cpid" '$5 != "" && $5 == p { print $1 }' "$ROSTER" 2>/dev/null)"
+    fi
+    if [ -z "$h" ] && [ -n "$mine" ]; then
+      # A bare join from a session that is already registered is a session that
+      # FORGOT, not one that wants a second identity. Suffixing used to hand it
+      # a fresh handle here — and, right behind it, a second Monitor. Answer
+      # with the registration it already has instead.
+      h="$(printf '%s\n' "$mine" | head -1)"
+      unlock
+      echo "already joined as '$h' — this session is registered, nothing to do."
+      if listener_live_mine "$h" "$sid" "$cpid"; then
+        echo "Your @$h listener is still running. Do NOT arm another Monitor."
+      else
+        echo "No live listener found for @$h. Arm one with this Monitor command (persistent):"
+        listen_cmd "$h"
+      fi
+      exit 0
+    fi
     if [ -z "$h" ]; then
       # No handle given: derive one from the project directory, and if a *live*
       # session already holds it, suffix instead of stealing it (two sessions in
@@ -328,9 +400,100 @@ case "$cmd" in
     # is the moment we would otherwise destroy it.
     cursor_get "$h" >/dev/null 2>&1 || cursor_set "$h" "$(log_size)"
     unlock
-    echo "joined as '$h'. Arm your listener with this Monitor command (persistent):"
-    listen_cmd "$h"
+    # A re-join while this session's listener is still running (the classic
+    # "did I already join?" moment) must not re-print the arm instruction —
+    # that instruction is exactly what talks a forgetful session into arming
+    # the second Monitor this feature exists to prevent.
+    if listener_live_mine "$h" "$sid" "$cpid"; then
+      echo "joined as '$h'. Your @$h listener is STILL RUNNING — do NOT arm another Monitor."
+    else
+      echo "joined as '$h'. Arm your listener with this Monitor command (persistent):"
+      listen_cmd "$h"
+    fi
     [ -n "$sid" ] || echo "note: CLAUDE_CODE_SESSION_ID is unset, so auto-leave on session end can't fire for '$h' — run 'bus leave $h' yourself." >&2
+    ;;
+  listen)
+    # The command a Monitor actually runs: the tail|bus-filter pipeline, wrapped
+    # in the duplicate-listener guard. The guard has to live HERE, at the moment
+    # the second pipeline would start — join can advise a forgetful session all
+    # it likes, but only the listener itself can make the duplicate fail instead
+    # of half-working (every message delivered twice, forever, silently).
+    h="${1:?usage: bus listen <handle>}"
+    lf="$(listener_file "$h")"
+    sid="${CLAUDE_CODE_SESSION_ID:-}"
+    cpid="$(claude_pid)"; cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
+    lock
+    for f in "$LISTENERS"/*; do
+      [ -f "$f" ] || continue
+      IFS='|' read -r lk_pid lk_pstart lk_cpid lk_cstart lk_sid lk_h <"$f"
+      [ -n "${lk_h:-}" ] || lk_h="${f##*/}"
+      # Listener process gone (or its pid recycled): the lock is stale. Clean it
+      # up — a graceful stop removes its own lock, but SIGKILL never gets to.
+      lk_alive=""
+      case "${lk_pid:-}" in
+        ''|*[!0-9]*) ;;
+        *) _c="$(proc_start "$lk_pid")"
+           if [ -n "$_c" ] && { [ -z "${lk_pstart:-}" ] || [ "$_c" = "$lk_pstart" ]; }; then lk_alive=1; fi;;
+      esac
+      if [ -z "$lk_alive" ]; then
+        rm -f "$f"
+        case "${lk_pid:-}" in ''|*[!0-9]*) ;; *) rm -f "$LISTENERS/.fifo.$lk_pid";; esac
+        continue
+      fi
+      # Owning Claude process provably dead: an orphaned pipeline delivering to
+      # nobody. It never blocks anyone; if it holds OUR handle, put it down and
+      # take the slot over.
+      own_dead=""
+      case "${lk_cpid:-}" in
+        ''|*[!0-9]*) ;;
+        *) _c="$(proc_start "$lk_cpid")"
+           if [ -z "$_c" ] || { [ -n "${lk_cstart:-}" ] && [ "$_c" != "$lk_cstart" ]; }; then own_dead=1; fi;;
+      esac
+      if [ -n "$own_dead" ]; then
+        if [ "$f" = "$lf" ]; then
+          kill "$lk_pid" 2>/dev/null
+          rm -f "$f" "$LISTENERS/.fifo.$lk_pid"
+          echo "note: replaced an orphaned @$lk_h listener (pid $lk_pid) whose session is gone." >&2
+        fi
+        continue
+      fi
+      if same_session "${lk_sid:-}" "${lk_cpid:-}" "$sid" "$cpid"; then
+        unlock
+        if [ "$f" = "$lf" ]; then
+          echo "error: this session is ALREADY listening as @$lk_h (pid $lk_pid)." >&2
+          echo "       Do NOT arm a second Monitor — the existing one is still delivering." >&2
+        else
+          echo "error: this session already has a live listener as @$lk_h (pid $lk_pid) — one Monitor per session." >&2
+          echo "       TaskStop that Monitor (and 'bus leave $lk_h' if renaming) before listening as @$h." >&2
+        fi
+        exit 1
+      fi
+      if [ "$f" = "$lf" ]; then
+        unlock
+        echo "error: a live listener for @$h is already armed by a different session (pid $lk_pid)." >&2
+        echo "       Two listeners on one handle deliver every message twice. If that listener is truly dead, kill pid $lk_pid and retry." >&2
+        exit 1
+      fi
+    done
+    printf '%s|%s|%s|%s|%s|%s\n' "$$" "$(proc_start "$$")" "$cpid" "$cstart" "$sid" "$h" >"$lf"
+    unlock
+    # Both stages started separately across a FIFO so each has a pid the trap
+    # can kill. A plain `tail | filter` pipeline hides tail's pid, and a tail
+    # that outlives its consumer lingers until its next write dies on SIGPIPE.
+    fifo="$LISTENERS/.fifo.$$"
+    rm -f "$fifo"
+    mkfifo "$fifo" || { rm -f "$lf"; echo "error: could not create listener fifo" >&2; exit 1; }
+    listen_cleanup() {
+      rm -f "$lf" "$fifo"
+      [ -n "${tail_pid:-}" ] && kill "$tail_pid" 2>/dev/null
+      [ -n "${filter_pid:-}" ] && kill "$filter_pid" 2>/dev/null
+      return 0
+    }
+    trap listen_cleanup EXIT
+    trap 'exit' INT TERM HUP
+    tail -F -n 0 "$LOG" >"$fifo" 2>/dev/null & tail_pid=$!
+    "$SELF_DIR/bus-filter" "$h" <"$fifo" & filter_pid=$!
+    wait "$filter_pid"
     ;;
   listen-cmd)
     listen_cmd "${1:?usage: bus listen-cmd <handle>}"
@@ -406,7 +569,13 @@ case "$cmd" in
     for h in $hs; do
       printf '@%s\n' "$h"
       printf '  matched by %s\n' "$via"
-      printf '  listen:    %s\n' "$(listen_cmd "$h")"   # $() strips listen_cmd's own newline
+      # Answer "am I listening?" too — it is the question right behind "what am
+      # I?", and guessing it wrong is how second Monitors get armed.
+      if listener_live_mine "$h" "$sid" "$cpid"; then
+        printf '  listener:  RUNNING — do NOT arm another Monitor\n'
+      else
+        printf '  listen:    %s\n' "$(listen_cmd "$h")"   # $() strips listen_cmd's own newline
+      fi
     done
     ;;
   who)
