@@ -81,10 +81,12 @@ they are quiet.
 after a restart. Pass `[hours]` to use a plain time window instead.
 
 ## leave
-`BUS leave <yourhandle>` deregisters early — **also TaskStop your Monitor**.
-Otherwise the SessionEnd hook does it when the session ends. It refuses to
-deregister a handle held by a *different* session; `--force` overrides, and is
-how you reclaim a name. `--by-session <id>` / `--by-cwd [--force] <path>` are the
+`BUS leave <yourhandle>` deregisters early and **puts your listener down** —
+the Monitor then reports its command exited; TaskStop it if you want the task
+entry cleared. Otherwise the SessionEnd hook does all of it when the session
+ends. It refuses to deregister a handle held by a *different* session;
+`--force` overrides (stopping that session's listener too), and is how you
+reclaim a name. `--by-session <id>` / `--by-cwd [--force] <path>` are the
 hook's own forms; you won't call those by hand.
 
 ## whoami / who / prune

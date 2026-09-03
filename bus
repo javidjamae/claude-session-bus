@@ -117,6 +117,18 @@ handles_by_cwd()     { awk -F'|' -v c="$1" '$2 == c { print $1 }' "$ROSTER" 2>/d
 
 proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'; }
 
+# THE liveness proof, singular: <pid> is running AND — when a start time was
+# recorded — is still the same process (pids get recycled, hence the start-time
+# guard). Every judgement of a recorded pid (roster rows, listener locks)
+# derives from this one predicate, so the roster and the locks can never
+# disagree about the same process.
+pid_alive() { # <pid> <recorded_start>
+  case "${1:-}" in ''|*[!0-9]*) return 1;; esac
+  _pa_c="$(proc_start "$1")"
+  [ -n "$_pa_c" ] || return 1
+  [ -z "${2:-}" ] || [ "$_pa_c" = "$2" ]
+}
+
 # Walk up from this script to the owning `claude` process. Empty if there isn't
 # one (bus run straight from a shell), which simply means "not reapable".
 claude_pid() {
@@ -156,8 +168,7 @@ prune_dead() {
         [ -n "$_force" ] && { forced="$forced $_ph"; _ph=""; continue; }
         ;;
       *)
-        _pcur="$(proc_start "$_ppid")"
-        if [ -z "$_pcur" ] || { [ -n "${_pstart:-}" ] && [ "$_pcur" != "$_pstart" ]; }; then
+        if ! pid_alive "$_ppid" "${_pstart:-}"; then
           reaped="$reaped $_ph"
           _ph=""; continue
         fi
@@ -198,14 +209,17 @@ lock() {
   trap unlock EXIT
 }
 
-# Deregister one handle: drop from roster, note it in the log, mark the log read.
+# Deregister one handle: drop from roster, note it in the log, mark the log
+# read, and put down this session's listener for the handle (a leave that
+# walks away from a live listener strands the handle for its next owner).
 # The cursor advance is what makes the *next* session's catchup exact: this
 # session listened right up to this instant, so the gap starts here and nowhere
 # else. Only graceful endings get this — see the read-cursor notes above.
-do_leave() {
+do_leave() { # <handle> [owner_sid] [force]
   roster_drop "$1"
   printf '[%s %s] offline\n' "$1" "$(now)" >>"$LOG"
   cursor_set "$1" "$(log_size)"
+  release_listener "$1" "${2:-${CLAUDE_CODE_SESSION_ID:-}}" "$(claude_pid)" "${3:-}"
 }
 
 # --- ownership --------------------------------------------------------------
@@ -218,15 +232,8 @@ do_leave() {
 
 row_field() { awk -F'|' -v hh="$1" -v n="$2" 'tolower($1)==tolower(hh) { print $n; exit }' "$ROSTER" 2>/dev/null; }
 
-# Is this row's recorded process still the one that registered it? A pid alone
-# isn't enough — pids get recycled, hence the start-time comparison.
-row_alive() {
-  _rp="$(row_field "$1" 5)"; _rs="$(row_field "$1" 6)"
-  case "${_rp:-}" in ''|*[!0-9]*) return 1;; esac
-  _rc="$(proc_start "$_rp")"
-  [ -n "$_rc" ] || return 1
-  [ -z "${_rs:-}" ] || [ "$_rc" = "$_rs" ]
-}
+# Is this row's recorded process still the one that registered it?
+row_alive() { pid_alive "$(row_field "$1" 5)" "$(row_field "$1" 6)"; }
 
 # --- listener locks ---------------------------------------------------------
 # One live listener per session — enforced, not requested. A session that
@@ -242,33 +249,105 @@ listener_file() { printf '%s/%s' "$LISTENERS" "$(handle_slug "$1")"; }
 # Do these two identities belong to the same Claude session? Session-id
 # evidence decides whenever both sides carry one — the id is what defines a
 # session, and it survives a resume. The owning-process pid only breaks the
-# tie when id evidence is missing (a plain-shell listener has neither).
+# tie when id evidence is missing (a plain-shell listener has neither). When
+# NEITHER side has any evidence this cannot match, so the one-Monitor-per-
+# session rule cannot protect a fully anonymous caller — `bus listen` warns
+# about that at arm time; the per-handle rule still applies.
 same_session() { # <their_sid> <their_cpid> <my_sid> <my_cpid>
   if [ -n "${1:-}" ] && [ -n "${3:-}" ]; then [ "$1" = "$3" ]; return; fi
   [ -n "${2:-}" ] && [ -n "${4:-}" ] && [ "$2" = "$4" ]
 }
 
-# Does THIS session already have a live listener for <handle>? Consulted by
-# join/whoami so their guidance never tells a listening session to arm a second
-# Monitor. An orphan — listener running but its session's process provably
-# gone — does not count as live: it is delivering to nobody, and the next
-# `bus listen` will replace it.
-listener_live_mine() { # <handle> <my_sid> <my_cpid>
-  _lm_f="$(listener_file "$1")"
-  [ -f "$_lm_f" ] || return 1
-  # shellcheck disable=SC2034  # _lm_h names the last field so read consumes it
-  IFS='|' read -r _lm_pid _lm_pstart _lm_cpid _lm_cstart _lm_sid _lm_h <"$_lm_f" 2>/dev/null
-  case "${_lm_pid:-}" in ''|*[!0-9]*) return 1;; esac
-  _lm_cur="$(proc_start "$_lm_pid")"
-  [ -n "$_lm_cur" ] || return 1
-  [ -z "${_lm_pstart:-}" ] || [ "$_lm_cur" = "$_lm_pstart" ] || return 1
-  case "${_lm_cpid:-}" in
-    ''|*[!0-9]*) ;;
-    *) _lm_oc="$(proc_start "$_lm_cpid")"
-       [ -n "$_lm_oc" ] || return 1
-       [ -z "${_lm_cstart:-}" ] || [ "$_lm_oc" = "$_lm_cstart" ] || return 1;;
-  esac
-  same_session "${_lm_sid:-}" "${_lm_cpid:-}" "${2:-}" "${3:-}"
+# Put a recorded listener down and clean up its lock + fifo. Waits for the
+# process to actually die (or turn zombie — its traps have run by then) before
+# removing the lock: a dying listener's own cleanup trap also removes its lock,
+# and racing it while a successor writes a fresh lock to the same path would
+# let the trap delete the successor's registration.
+reap_listener_lock() { # <lockfile> <listener_pid>
+  kill "$2" 2>/dev/null
+  _rk_i=0
+  while [ "$_rk_i" -lt 20 ]; do
+    _rk_st="$(ps -o stat= -p "$2" 2>/dev/null | tr -d ' ')"
+    case "${_rk_st:-}" in ''|Z*) break;; esac
+    sleep 0.1; _rk_i=$((_rk_i+1))
+  done
+  kill -9 "$2" 2>/dev/null
+  rm -f "$1" "$LISTENERS/.fifo.$2"
+  return 0
+}
+
+# Which handle is this session's live listener armed under, if any? This is
+# the guard's own question — per SESSION, not per handle — and the advisory
+# layer (join/whoami) must ask the same one, or it would hand out an arm
+# command the guard is guaranteed to refuse. Orphans (owning session's process
+# provably gone) don't count: they deliver to nobody and the next `bus listen`
+# or `bus prune` puts them down.
+session_listener() { # <my_sid> <my_cpid> -> prints the handle; rc 1 if none
+  for _sl_f in "$LISTENERS"/*; do
+    [ -f "$_sl_f" ] || continue
+    IFS='|' read -r _sl_pid _sl_pstart _sl_cpid _sl_cstart _sl_sid _sl_h <"$_sl_f" 2>/dev/null
+    pid_alive "${_sl_pid:-}" "${_sl_pstart:-}" || continue
+    case "${_sl_cpid:-}" in
+      ''|*[!0-9]*) ;;   # no owner recorded: cannot judge orphan-ness, count it
+      *) pid_alive "$_sl_cpid" "${_sl_cstart:-}" || continue;;
+    esac
+    if same_session "${_sl_sid:-}" "${_sl_cpid:-}" "${1:-}" "${2:-}"; then
+      printf '%s\n' "${_sl_h:-${_sl_f##*/}}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Clean the listener directory: drop locks whose listener process is gone, and
+# put down orphans — listeners still tailing for a session whose process is
+# provably dead. Run by `bus listen` before it judges blockers, and by the
+# explicit `bus prune` (the documented SIGKILL backstop), so crashed sessions
+# never leak pipelines or locks indefinitely. Prints what it did; caller must
+# hold the lock.
+listener_sweep() {
+  for _ls_f in "$LISTENERS"/*; do
+    [ -f "$_ls_f" ] || continue
+    IFS='|' read -r _ls_pid _ls_pstart _ls_cpid _ls_cstart _ls_sid _ls_h <"$_ls_f" 2>/dev/null
+    [ -n "${_ls_h:-}" ] || _ls_h="${_ls_f##*/}"
+    if ! pid_alive "${_ls_pid:-}" "${_ls_pstart:-}"; then
+      rm -f "$_ls_f"
+      case "${_ls_pid:-}" in ''|*[!0-9]*) ;; *) rm -f "$LISTENERS/.fifo.$_ls_pid";; esac
+      printf 'released @%s listener lock (listener process gone)\n' "$_ls_h"
+      continue
+    fi
+    case "${_ls_cpid:-}" in
+      ''|*[!0-9]*) ;;   # no owner recorded: cannot prove it an orphan, keep it
+      *) if ! pid_alive "$_ls_cpid" "${_ls_cstart:-}"; then
+           reap_listener_lock "$_ls_f" "$_ls_pid"
+           printf 'put down @%s listener (pid %s, its session is gone)\n' "$_ls_h" "$_ls_pid"
+         fi;;
+    esac
+  done
+  return 0
+}
+
+# Release a handle's listener on the way out of the bus. A leave that walked
+# away from a live listener used to leave the handle permanently unlistenable
+# for its next owner ('armed by a different session — kill pid N') while the
+# old session kept waking on mail for a name it no longer held. Only this
+# session's own listener is stopped, unless <force> — the deliberate reclaim —
+# says otherwise; stale locks are cleaned regardless.
+release_listener() { # <handle> <my_sid> <my_cpid> [force]
+  _re_f="$(listener_file "$1")"
+  [ -f "$_re_f" ] || return 0
+  # shellcheck disable=SC2034  # _re_h names the last field so read consumes it
+  IFS='|' read -r _re_pid _re_pstart _re_cpid _re_cstart _re_sid _re_h <"$_re_f" 2>/dev/null
+  if ! pid_alive "${_re_pid:-}" "${_re_pstart:-}"; then
+    rm -f "$_re_f"
+    case "${_re_pid:-}" in ''|*[!0-9]*) ;; *) rm -f "$LISTENERS/.fifo.$_re_pid";; esac
+    return 0
+  fi
+  if [ -n "${4:-}" ] || same_session "${_re_sid:-}" "${_re_cpid:-}" "${2:-}" "${3:-}"; then
+    reap_listener_lock "$_re_f" "$_re_pid"
+    printf 'stopped the @%s listener (pid %s) — its Monitor will report the command exited\n' "$1" "$_re_pid"
+  fi
+  return 0
 }
 
 # Time-windowed catchup: the fallback for handles with no cursor yet, and what
@@ -333,6 +412,19 @@ cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
   join)
     h="${1:-}"
+    # Handles live in log address fields, |-delimited roster rows, and lock/
+    # cursor FILENAMES — so an explicit handle is folded to lowercase (every
+    # matcher is case-insensitive anyway) and anything that would not survive
+    # all three verbatim is refused. Two distinct raw handles that slug to one
+    # filename would otherwise share a listener lock and hard-refuse each other.
+    if [ -n "$h" ]; then
+      h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
+      case "$h" in
+        *[!a-z0-9_-]*)
+          echo "error: invalid handle '$1' — use letters, digits, '-' and '_' only." >&2
+          exit 1;;
+      esac
+    fi
     sid="${CLAUDE_CODE_SESSION_ID:-}"   # exported into every Bash tool call by Claude Code
     cpid="$(claude_pid)"                # owning Claude Code process, for the hard-kill reaper
     cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
@@ -355,8 +447,12 @@ case "$cmd" in
       h="$(printf '%s\n' "$mine" | head -1)"
       unlock
       echo "already joined as '$h' — this session is registered, nothing to do."
-      if listener_live_mine "$h" "$sid" "$cpid"; then
+      lh="$(session_listener "$sid" "$cpid")"
+      if [ "$(handle_slug "${lh:-}")" = "$(handle_slug "$h")" ] && [ -n "$lh" ]; then
         echo "Your @$h listener is still running. Do NOT arm another Monitor."
+      elif [ -n "$lh" ]; then
+        echo "This session's Monitor is still listening as @$lh — one Monitor per session."
+        echo "TaskStop that Monitor (and 'bus leave $lh' if renaming) before arming @$h."
       else
         echo "No live listener found for @$h. Arm one with this Monitor command (persistent):"
         listen_cmd "$h"
@@ -403,9 +499,15 @@ case "$cmd" in
     # A re-join while this session's listener is still running (the classic
     # "did I already join?" moment) must not re-print the arm instruction —
     # that instruction is exactly what talks a forgetful session into arming
-    # the second Monitor this feature exists to prevent.
-    if listener_live_mine "$h" "$sid" "$cpid"; then
+    # the second Monitor this feature exists to prevent. The question is the
+    # guard's own, per SESSION: a listener live under any OTHER handle would
+    # make `bus listen $h` refuse, so advising "arm it" would be a lie.
+    lh="$(session_listener "$sid" "$cpid")"
+    if [ "$(handle_slug "${lh:-}")" = "$(handle_slug "$h")" ] && [ -n "$lh" ]; then
       echo "joined as '$h'. Your @$h listener is STILL RUNNING — do NOT arm another Monitor."
+    elif [ -n "$lh" ]; then
+      echo "joined as '$h', but this session's Monitor is still listening as @$lh — one Monitor per session."
+      echo "TaskStop that Monitor (and 'bus leave $lh' if renaming); then run 'bus join $h' again for the arm command."
     else
       echo "joined as '$h'. Arm your listener with this Monitor command (persistent):"
       listen_cmd "$h"
@@ -419,62 +521,59 @@ case "$cmd" in
     # it likes, but only the listener itself can make the duplicate fail instead
     # of half-working (every message delivered twice, forever, silently).
     h="${1:?usage: bus listen <handle>}"
+    h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"   # same canonical form join enforces
+    case "$h" in
+      *[!a-z0-9_-]*)
+        echo "error: invalid handle '$1' — use letters, digits, '-' and '_' only." >&2
+        exit 1;;
+    esac
     lf="$(listener_file "$h")"
     sid="${CLAUDE_CODE_SESSION_ID:-}"
     cpid="$(claude_pid)"; cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
+    [ -n "$sid$cpid" ] || echo "warning: cannot attribute this listener to a session (no session id, no Claude process) — the one-Monitor-per-session rule cannot protect it." >&2
     lock
+    # Clear the provably-dead first: stale locks (SIGKILLed listeners) and
+    # orphans (pipelines whose session's process is gone) — including orphans
+    # under OTHER handles, or a crashed session's pipeline would leak until
+    # someone happened to reuse its exact handle.
+    swept="$(listener_sweep)"
+    [ -n "$swept" ] && printf '%s\n' "$swept" | sed 's/^/note: /' >&2
+    # Then judge the survivors — all provably live, owner alive or unknown.
+    # Classify them ALL before refusing: the same-session verdict must win over
+    # the foreign-holder one, or which refusal (and which remedy) the user sees
+    # would depend on lock-filename collation order, and a session could be told
+    # to kill a healthy peer's listener instead of hearing about its own.
+    own_same=""; own_other=""; own_other_pid=""; foreign_pid=""
     for f in "$LISTENERS"/*; do
       [ -f "$f" ] || continue
+      # shellcheck disable=SC2034  # lk_h names the last field so read consumes it
       IFS='|' read -r lk_pid lk_pstart lk_cpid lk_cstart lk_sid lk_h <"$f"
       [ -n "${lk_h:-}" ] || lk_h="${f##*/}"
-      # Listener process gone (or its pid recycled): the lock is stale. Clean it
-      # up — a graceful stop removes its own lock, but SIGKILL never gets to.
-      lk_alive=""
-      case "${lk_pid:-}" in
-        ''|*[!0-9]*) ;;
-        *) _c="$(proc_start "$lk_pid")"
-           if [ -n "$_c" ] && { [ -z "${lk_pstart:-}" ] || [ "$_c" = "$lk_pstart" ]; }; then lk_alive=1; fi;;
-      esac
-      if [ -z "$lk_alive" ]; then
-        rm -f "$f"
-        case "${lk_pid:-}" in ''|*[!0-9]*) ;; *) rm -f "$LISTENERS/.fifo.$lk_pid";; esac
-        continue
-      fi
-      # Owning Claude process provably dead: an orphaned pipeline delivering to
-      # nobody. It never blocks anyone; if it holds OUR handle, put it down and
-      # take the slot over.
-      own_dead=""
-      case "${lk_cpid:-}" in
-        ''|*[!0-9]*) ;;
-        *) _c="$(proc_start "$lk_cpid")"
-           if [ -z "$_c" ] || { [ -n "${lk_cstart:-}" ] && [ "$_c" != "$lk_cstart" ]; }; then own_dead=1; fi;;
-      esac
-      if [ -n "$own_dead" ]; then
-        if [ "$f" = "$lf" ]; then
-          kill "$lk_pid" 2>/dev/null
-          rm -f "$f" "$LISTENERS/.fifo.$lk_pid"
-          echo "note: replaced an orphaned @$lk_h listener (pid $lk_pid) whose session is gone." >&2
-        fi
-        continue
-      fi
+      pid_alive "${lk_pid:-}" "${lk_pstart:-}" || continue
       if same_session "${lk_sid:-}" "${lk_cpid:-}" "$sid" "$cpid"; then
-        unlock
-        if [ "$f" = "$lf" ]; then
-          echo "error: this session is ALREADY listening as @$lk_h (pid $lk_pid)." >&2
-          echo "       Do NOT arm a second Monitor — the existing one is still delivering." >&2
-        else
-          echo "error: this session already has a live listener as @$lk_h (pid $lk_pid) — one Monitor per session." >&2
-          echo "       TaskStop that Monitor (and 'bus leave $lk_h' if renaming) before listening as @$h." >&2
-        fi
-        exit 1
-      fi
-      if [ "$f" = "$lf" ]; then
-        unlock
-        echo "error: a live listener for @$h is already armed by a different session (pid $lk_pid)." >&2
-        echo "       Two listeners on one handle deliver every message twice. If that listener is truly dead, kill pid $lk_pid and retry." >&2
-        exit 1
+        if [ "$f" = "$lf" ]; then own_same="$lk_pid"; else own_other="$lk_h"; own_other_pid="$lk_pid"; fi
+      elif [ "$f" = "$lf" ]; then
+        foreign_pid="$lk_pid"
       fi
     done
+    if [ -n "$own_same" ]; then
+      unlock
+      echo "error: this session is ALREADY listening as @$h (pid $own_same)." >&2
+      echo "       Do NOT arm a second Monitor — the existing one is still delivering." >&2
+      exit 1
+    fi
+    if [ -n "$own_other" ]; then
+      unlock
+      echo "error: this session already has a live listener as @$own_other (pid $own_other_pid) — one Monitor per session." >&2
+      echo "       TaskStop that Monitor (and 'bus leave $own_other' if renaming) before listening as @$h." >&2
+      exit 1
+    fi
+    if [ -n "$foreign_pid" ]; then
+      unlock
+      echo "error: a live listener for @$h is already armed by a different session (pid $foreign_pid)." >&2
+      echo "       Two listeners on one handle deliver every message twice. If that listener is truly dead, kill pid $foreign_pid and retry." >&2
+      exit 1
+    fi
     printf '%s|%s|%s|%s|%s|%s\n' "$$" "$(proc_start "$$")" "$cpid" "$cstart" "$sid" "$h" >"$lf"
     unlock
     # Both stages started separately across a FIFO so each has a pid the trap
@@ -484,14 +583,23 @@ case "$cmd" in
     rm -f "$fifo"
     mkfifo "$fifo" || { rm -f "$lf"; echo "error: could not create listener fifo" >&2; exit 1; }
     listen_cleanup() {
-      rm -f "$lf" "$fifo"
+      # Remove the lock only if it is still OURS: a listener being put down by
+      # a successor must not delete the fresh lock that successor just wrote.
+      if [ -f "$lf" ]; then
+        IFS='|' read -r _lc_pid _lc_rest <"$lf" 2>/dev/null
+        [ "${_lc_pid:-}" = "$$" ] && rm -f "$lf"
+      fi
+      rm -f "$fifo"
       [ -n "${tail_pid:-}" ] && kill "$tail_pid" 2>/dev/null
       [ -n "${filter_pid:-}" ] && kill "$filter_pid" 2>/dev/null
       return 0
     }
     trap listen_cleanup EXIT
     trap 'exit' INT TERM HUP
-    tail -F -n 0 "$LOG" >"$fifo" 2>/dev/null & tail_pid=$!
+    # tail's stderr stays on the Monitor's stream on purpose: `tail -F` retries
+    # a vanished or unreadable log forever, so muting it would leave a listener
+    # that delivers nothing while everything reports it RUNNING.
+    tail -F -n 0 "$LOG" >"$fifo" & tail_pid=$!
     "$SELF_DIR/bus-filter" "$h" <"$fifo" & filter_pid=$!
     wait "$filter_pid"
     ;;
@@ -566,13 +674,18 @@ case "$cmd" in
       echo "not on the bus. Join with: bus join <handle>" >&2
       exit 1
     fi
+    # Answer "am I listening?" too — it is the question right behind "what am
+    # I?", and guessing it wrong is how second Monitors get armed. Asked per
+    # SESSION (the guard's own question), so a listener live under a different
+    # handle is reported rather than an arm command the guard would refuse.
+    lh="$(session_listener "$sid" "$cpid")"
     for h in $hs; do
       printf '@%s\n' "$h"
       printf '  matched by %s\n' "$via"
-      # Answer "am I listening?" too — it is the question right behind "what am
-      # I?", and guessing it wrong is how second Monitors get armed.
-      if listener_live_mine "$h" "$sid" "$cpid"; then
+      if [ "$(handle_slug "${lh:-}")" = "$(handle_slug "$h")" ] && [ -n "$lh" ]; then
         printf '  listener:  RUNNING — do NOT arm another Monitor\n'
+      elif [ -n "$lh" ]; then
+        printf '  listener:  none for @%s — this session is listening as @%s (one Monitor per session)\n' "$h" "$lh"
       else
         printf '  listen:    %s\n' "$(listen_cmd "$h")"   # $() strips listen_cmd's own newline
       fi
@@ -618,10 +731,11 @@ case "$cmd" in
     # --force also drops rows carrying no pid. Only ever from an explicit prune —
     # the implicit ones inside `who`/`join` never pass it.
     force=""; [ "${1:-}" = "--force" ] && force=1
-    lock; reaped="$(prune_dead "$force")"; unlock
+    lock; reaped="$(prune_dead "$force")"; lswept="$(listener_sweep)"; unlock
     swept="$(blob_sweep)"       # only the explicit prune sweeps blobs; who/join stay cheap
-    if [ -z "$reaped" ] && [ -z "$swept" ]; then echo "nothing to prune."; fi
+    if [ -z "$reaped" ] && [ -z "$swept" ] && [ -z "$lswept" ]; then echo "nothing to prune."; fi
     for h in $reaped; do echo "reaped: @$h"; done
+    [ -n "$lswept" ] && printf '%s\n' "$lswept"
     [ -n "$swept" ] && echo "swept: $swept blob(s) older than ${SESSION_BUS_BLOB_DAYS:-30}d"
     ;;
   catchup)
@@ -665,7 +779,7 @@ case "$cmd" in
         lock
         hs="$(handles_by_session "$sid")"
         [ -n "$hs" ] || { echo "no bus registration for session $sid"; exit 0; }
-        for h in $hs; do do_leave "$h"; echo "left: @$h"; done
+        for h in $hs; do do_leave "$h" "$sid"; echo "left: @$h"; done
         ;;
       # Fallback for when no session id is available. Ambiguous by design when
       # several handles share a cwd, so it refuses rather than guessing.
@@ -691,7 +805,7 @@ case "$cmd" in
             echo "kept @$h: registered to a live process (pid $(row_field "$h" 5)) that is not this session"
             continue
           fi
-          do_leave "$h"; echo "left: @$h"
+          do_leave "$h" "" "$force"; echo "left: @$h"
         done
         ;;
       *)
@@ -709,7 +823,7 @@ case "$cmd" in
           echo "       It is probably still listening. Pass --force to deregister it anyway." >&2
           exit 1
         fi
-        do_leave "$h"
+        do_leave "$h" "" "$lf"
         echo "left."
         ;;
     esac

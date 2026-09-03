@@ -131,8 +131,15 @@ instead of re-printing the arm instruction.
 The refusal is keyed to *live* listeners only, by the same pid + start-time
 proof the roster uses. A listener whose process is gone never blocks anyone; an
 orphan — still tailing, but its session's process is dead, so it delivers to
-nobody — is killed and replaced on the next `bus listen`. A graceful stop
-(TaskStop, session end) removes its own lock on the way out.
+nobody — is put down by the next `bus listen` (any handle) or `bus prune`. A
+graceful stop (TaskStop, session end) removes its own lock on the way out, and
+`bus leave` stops the leaving session's listener too, so a handed-over handle
+is never stranded behind its previous owner's Monitor.
+
+One caveat on upgrade: listeners armed before this guard existed hold no lock,
+so the guard cannot see them. Re-arm each session once — TaskStop the old
+Monitor, `/session-bus join`, arm the printed command — and everything from
+then on is covered.
 
 ### What `SessionEnd` actually covers
 
