@@ -4,10 +4,11 @@
 #
 # test/run.sh pipes fixed strings into bus-filter. That proves the matching
 # rules and nothing about delivery: the listener a session actually arms is
-# `tail -F bus.log | bus-filter <handle>`, a long-running pipeline that has
+# `bus listen <handle>` — a long-running tail|bus-filter pipeline that has
 # failed in ways no unit test could see (it once died with exit 144, and any
 # unbuffered stage would silently hold messages until a later write flushed
-# them). This exercises that pipeline for real, end to end.
+# them). This exercises that pipeline for real, end to end, including the
+# duplicate-listener guard and the lock cleanup on a graceful stop.
 #
 # A fresh clone on purpose: a working checkout accumulates state — an untracked
 # file, a stale mode bit, a blob directory — that a user installing from scratch
@@ -24,17 +25,20 @@ REF="${1:-HEAD}"
 TMP="$(mktemp -d)"
 CLONE="$TMP/clone"
 export SESSION_BUS_DIR="$TMP/bus"
-TAIL_PID=""; FILTER_PID=""
-# Kill BOTH stages by pid. Killing a process group was the obvious way and the
-# wrong one: macOS has no setsid, so the pipeline stayed in this script's group,
-# the survivors held the caller's stdout pipe open, and the run hung after the
-# last assertion — green, and never returning.
+LISTEN_PID=""
+# `bus listen` owns its two pipeline stages and kills them from its own exit
+# trap on TERM — that cleanup is part of what this battery proves. The escalation
+# to -9 is only so a regression in that trap fails an assertion instead of
+# hanging the suite (the survivors would hold the caller's stdout pipe open, and
+# the run would sit green after the last assertion, never returning).
 stop_listener() {
-  for _p in "$FILTER_PID" "$TAIL_PID"; do
-    [ -n "$_p" ] && kill "$_p" 2>/dev/null
-  done
-  wait "$FILTER_PID" "$TAIL_PID" 2>/dev/null
-  TAIL_PID=""; FILTER_PID=""
+  [ -n "$LISTEN_PID" ] || return 0
+  kill "$LISTEN_PID" 2>/dev/null
+  _i=0
+  while kill -0 "$LISTEN_PID" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i+1)); done
+  kill -9 "$LISTEN_PID" 2>/dev/null
+  wait "$LISTEN_PID" 2>/dev/null
+  LISTEN_PID=""
   return 0
 }
 cleanup() { stop_listener; rm -rf "$TMP"; return 0; }
@@ -70,20 +74,27 @@ case "$v" in *"$sha"*) pass "bus version reports the cloned commit ($v)";;
              *) fail "bus version reports the cloned commit" "want $sha in [$v]";; esac
 
 # ---------------------------------------------------------------------------
-section "live delivery through tail -F | bus-filter"
+section "live delivery through bus listen (the real Monitor command)"
 "$BUS" join alice >/dev/null 2>&1
 "$BUS" join bob   >/dev/null 2>&1
 INBOX="$TMP/alice.inbox"
 : > "$INBOX"
-# The same two stages `bus join` prints, but started separately across a FIFO so
-# each has a pid we can kill. Their stderr goes to a file, never to the caller's
-# stream, so a survivor can never hold the invoking pipe open.
-FIFO="$TMP/listener.fifo"; mkfifo "$FIFO"
-tail -F -n 0 "$SESSION_BUS_DIR/bus.log" > "$FIFO" 2>"$TMP/tail.err" &
-TAIL_PID=$!
-"$CLONE/bus-filter" alice < "$FIFO" >> "$INBOX" 2>"$TMP/filter.err" &
-FILTER_PID=$!
-sleep 1   # let tail attach before the first write, or the event predates the watch
+# Exactly what a session's Monitor runs: `bus listen alice`, stdout into the
+# inbox. Its stderr goes to a file, never to the caller's stream, so a survivor
+# can never hold the invoking pipe open.
+CLAUDE_CODE_SESSION_ID=e2e-alice "$BUS" listen alice >> "$INBOX" 2>"$TMP/listen.err" &
+LISTEN_PID=$!
+_i=0   # armed = the lock exists; then give tail a beat to attach before the first write
+while [ ! -s "$SESSION_BUS_DIR/listeners/alice" ] && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i+1)); done
+[ -s "$SESSION_BUS_DIR/listeners/alice" ] && pass "bus listen registers its listener lock" \
+  || fail "bus listen registers its listener lock" "no lock file in 10s"
+sleep 1
+
+dup="$(CLAUDE_CODE_SESSION_ID=e2e-alice "$BUS" listen alice 2>&1)"; rc=$?
+[ "$rc" = "1" ] && pass "a second listener for the same session refuses to start" \
+  || fail "a second listener for the same session refuses to start" "rc $rc: $dup"
+case "$dup" in *"ALREADY listening"*) pass "the refusal says why";;
+               *) fail "the refusal says why" "got [$dup]";; esac
 
 "$BUS" send bob @alice "ping through the real pipeline" >/dev/null
 wait_for "$INBOX" "ping through the real pipeline" && pass "direct mention wakes the live listener" \
@@ -114,8 +125,10 @@ grep -qF "not addressed to alice" "$INBOX" \
 stop_listener
 # The listener must not have died on its own before we stopped it — a filter
 # that exits early looks exactly like a quiet bus.
-[ -s "$TMP/filter.err" ] && fail "listener ran without errors" "$(head -2 "$TMP/filter.err")" \
+[ -s "$TMP/listen.err" ] && fail "listener ran without errors" "$(head -2 "$TMP/listen.err")" \
                          || pass "listener ran without errors"
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "a stopped listener releases its lock" "lock survived" \
+                                          || pass "a stopped listener releases its lock"
 
 # ---------------------------------------------------------------------------
 section "blob round-trip and catchup across a restart"

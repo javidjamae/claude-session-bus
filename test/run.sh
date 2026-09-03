@@ -14,7 +14,13 @@ BUS="$REPO/bus"
 FILTER="$REPO/bus-filter"
 
 TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TMP_ROOT"' EXIT
+LISTEN_PIDS=""   # background `bus listen` processes spawned by tests; reaped on exit
+cleanup() {
+  for _lp in $LISTEN_PIDS; do kill "$_lp" 2>/dev/null; done
+  rm -rf "$TMP_ROOT"
+  return 0
+}
+trap cleanup EXIT
 
 PASS=0; FAIL=0
 if [ -t 1 ]; then G=$'\033[32m'; R=$'\033[31m'; B=$'\033[1m'; Z=$'\033[0m'; else G=; R=; B=; Z=; fi
@@ -251,6 +257,203 @@ assert_contains "--by-cwd still removes a row whose process is gone" \
   "$("$BUS" leave --by-cwd /p/x 2>&1)" "left: @goner"
 
 # ---------------------------------------------------------------------------
+section "listen guard (one live monitor per session)"
+# `bus listen` blocks by design, so allowed listeners run in the background and
+# are reaped by the exit trap; refused ones exit on their own and are safe to
+# run in the foreground.
+spawn_listener() { # <sid> <handle>  — sets SPAWNED to the listener's pid
+  CLAUDE_CODE_SESSION_ID="$1" "$BUS" listen "$2" >/dev/null 2>&1 &
+  SPAWNED=$!
+  LISTEN_PIDS="$LISTEN_PIDS $SPAWNED"
+}
+wait_lockfile() { # <handle> [secs] — until the listener has registered its lock
+  _deadline=$(( $(date +%s) + ${2:-10} ))
+  while [ "$(date +%s)" -lt "$_deadline" ]; do
+    [ -s "$SESSION_BUS_DIR/listeners/$1" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+wait_lock_not_pid() { # <handle> <pid> [secs] — until the lock belongs to someone else
+  _deadline=$(( $(date +%s) + ${3:-10} ))
+  while [ "$(date +%s)" -lt "$_deadline" ]; do
+    if [ -s "$SESSION_BUS_DIR/listeners/$1" ] && ! grep -q "^$2|" "$SESSION_BUS_DIR/listeners/$1"; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+fresh
+spawn_listener SID-L alice; L1=$SPAWNED
+wait_lockfile alice && pass "listener records its lock" || fail "listener records its lock" "no lock file appeared"
+out="$(CLAUDE_CODE_SESSION_ID=SID-L "$BUS" listen alice 2>&1)"; rc=$?
+assert_eq       "same session, same handle: duplicate refused"     "$rc" "1"
+assert_contains "refusal says it is already listening"             "$out" "ALREADY listening as @alice"
+out="$(CLAUDE_CODE_SESSION_ID=SID-L "$BUS" listen beta 2>&1)"; rc=$?
+assert_eq       "same session, new handle: second monitor refused" "$rc" "1"
+assert_contains "refusal names the handle already held"            "$out" "@alice"
+assert_contains "refusal states the rule"                          "$out" "one Monitor per session"
+out="$(CLAUDE_CODE_SESSION_ID=SID-M "$BUS" listen alice 2>&1)"; rc=$?
+assert_eq       "another session, same handle: refused"            "$rc" "1"
+assert_contains "cross-session refusal says whose it is"           "$out" "different session"
+spawn_listener SID-M beta; L2=$SPAWNED
+wait_lockfile beta && pass "different session + different handle may listen" \
+                   || fail "different session + different handle may listen" "no lock file appeared"
+kill "$L1" 2>/dev/null; wait "$L1" 2>/dev/null
+[ ! -f "$SESSION_BUS_DIR/listeners/alice" ] && pass "graceful stop removes the lock" \
+                                            || fail "graceful stop removes the lock" "lock survived TERM"
+spawn_listener SID-L alice; L3=$SPAWNED
+wait_lockfile alice && pass "slot reusable after a graceful stop" \
+                    || fail "slot reusable after a graceful stop" "no lock file appeared"
+kill "$L2" "$L3" 2>/dev/null; wait "$L2" "$L3" 2>/dev/null
+
+# A SIGKILLed listener leaves its lock behind; the dead pid proves it stale.
+fresh
+mkdir -p "$SESSION_BUS_DIR/listeners"
+stale="$(dead_pid2)"
+printf '%s|||||alice\n' "$stale" > "$SESSION_BUS_DIR/listeners/alice"
+spawn_listener SID-N alice; L4=$SPAWNED
+wait_lock_not_pid alice "$stale" && pass "stale lock (dead listener) never blocks" \
+                                 || fail "stale lock (dead listener) never blocks" "takeover did not happen"
+kill "$L4" 2>/dev/null; wait "$L4" 2>/dev/null
+
+# An orphan — listener alive, owning session's process gone — is replaced, and
+# the orphaned pipeline is put down rather than left tailing for nobody.
+fresh
+mkdir -p "$SESSION_BUS_DIR/listeners"
+sleep 30 & ORPHAN=$!
+disown "$ORPHAN"   # keep bash from announcing "Terminated" when the guard kills it
+LISTEN_PIDS="$LISTEN_PIDS $ORPHAN"
+orphan_start="$(ps -o lstart= -p "$ORPHAN" | sed 's/^ *//;s/ *$//')"
+printf '%s|%s|%s|%s|SID-DEAD|alice\n' "$ORPHAN" "$orphan_start" "$(dead_pid2)" "Mon Jan  1 00:00:00 2001" > "$SESSION_BUS_DIR/listeners/alice"
+spawn_listener SID-NEW alice; L5=$SPAWNED
+wait_lock_not_pid alice "$ORPHAN" && pass "orphaned listener is replaced" \
+                                  || fail "orphaned listener is replaced" "takeover did not happen"
+_deadline=$(( $(date +%s) + 10 )); dead=""
+while [ "$(date +%s)" -lt "$_deadline" ]; do kill -0 "$ORPHAN" 2>/dev/null || { dead=1; break; }; sleep 0.1; done
+[ -n "$dead" ] && pass "orphaned pipeline is killed" || fail "orphaned pipeline is killed" "orphan pid still alive"
+kill "$L5" 2>/dev/null; wait "$L5" 2>/dev/null
+
+# The pid-keyed fallback: with no session ids anywhere, a live listener armed
+# by a live process still refuses another would-be listener on the handle.
+fresh
+mkdir -p "$SESSION_BUS_DIR/listeners"
+printf '%s|%s|%s|%s||alice\n' "$$" "$livestart" "$$" "$livestart" > "$SESSION_BUS_DIR/listeners/alice"
+out="$(env -u CLAUDE_CODE_SESSION_ID "$BUS" listen alice 2>&1)"; rc=$?
+assert_eq       "id-less live listener still refuses a duplicate" "$rc" "1"
+assert_contains "id-less refusal takes the cross-session branch"  "$out" "different session"
+
+# Refusal precedence: a session that already holds the one-Monitor slot must
+# hear about ITS OWN listener, not be told to kill a healthy foreign one —
+# regardless of lock-filename collation order ('alice' sorts before 'zeta').
+fresh
+mkdir -p "$SESSION_BUS_DIR/listeners"
+printf '%s|%s|%s|%s|SID-FOREIGN|alice\n' "$$" "$livestart" "$$" "$livestart" > "$SESSION_BUS_DIR/listeners/alice"
+spawn_listener SID-Z zeta; LZ=$SPAWNED
+wait_lockfile zeta || fail "zeta listener armed" "no lock file appeared"
+out="$(CLAUDE_CODE_SESSION_ID=SID-Z "$BUS" listen alice 2>&1)"; rc=$?
+assert_eq           "own-session verdict outranks the foreign holder" "$rc" "1"
+assert_contains     "the refusal names the session's own listener"    "$out" "@zeta"
+assert_not_contains "and does not advise killing the foreign one"     "$out" "different session"
+kill "$LZ" 2>/dev/null; wait "$LZ" 2>/dev/null
+
+# leave puts this session's listener down: a leave that walked away from a live
+# listener stranded the handle for its next owner and kept the old session
+# waking on mail for a name it no longer held.
+fresh
+CLAUDE_CODE_SESSION_ID=SID-K "$BUS" join epsilon >/dev/null 2>&1
+spawn_listener SID-K epsilon; LK=$SPAWNED
+wait_lockfile epsilon || fail "epsilon listener armed" "no lock file appeared"
+out="$(CLAUDE_CODE_SESSION_ID=SID-K "$BUS" leave epsilon 2>&1)"
+assert_contains "leave reports stopping the listener" "$out" "stopped the @epsilon listener"
+[ ! -f "$SESSION_BUS_DIR/listeners/epsilon" ] && pass "leave releases the listener lock" \
+                                              || fail "leave releases the listener lock" "lock survived leave"
+wait "$LK" 2>/dev/null
+kill -0 "$LK" 2>/dev/null && fail "leave put the listener process down" "still running" \
+                          || pass "leave put the listener process down"
+
+# Orphans under OTHER handles are reaped too — a crashed session's pipeline
+# must not leak until someone happens to reuse its exact handle.
+fresh
+mkdir -p "$SESSION_BUS_DIR/listeners"
+sleep 30 & ORPH3=$!
+disown "$ORPH3"
+LISTEN_PIDS="$LISTEN_PIDS $ORPH3"
+printf '%s|%s|%s|Mon Jan  1 00:00:00 2001|SID-DEAD|other\n' "$ORPH3" "$(ps -o lstart= -p "$ORPH3" | sed 's/^ *//;s/ *$//')" "$(dead_pid2)" > "$SESSION_BUS_DIR/listeners/other"
+spawn_listener SID-P mine; LP=$SPAWNED
+wait_lockfile mine || fail "mine listener armed" "no lock file appeared"
+_deadline=$(( $(date +%s) + 10 )); gone=""
+while [ "$(date +%s)" -lt "$_deadline" ]; do [ ! -f "$SESSION_BUS_DIR/listeners/other" ] && { gone=1; break; }; sleep 0.1; done
+[ -n "$gone" ] && pass "listen sweeps orphans under other handles" \
+               || fail "listen sweeps orphans under other handles" "orphan lock survived"
+kill -0 "$ORPH3" 2>/dev/null && fail "the other-handle orphan is put down" "still running" \
+                             || pass "the other-handle orphan is put down"
+kill "$LP" 2>/dev/null; wait "$LP" 2>/dev/null
+
+# prune sweeps the listener directory too — it is the documented SIGKILL
+# backstop, and listener litter is exactly what a SIGKILL leaves behind.
+fresh
+mkdir -p "$SESSION_BUS_DIR/listeners"
+printf '%s|||||stalehandle\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/listeners/stalehandle"
+sleep 30 & ORPH4=$!
+disown "$ORPH4"
+LISTEN_PIDS="$LISTEN_PIDS $ORPH4"
+printf '%s|%s|%s|Mon Jan  1 00:00:00 2001|SID-DEAD|orphhandle\n' "$ORPH4" "$(ps -o lstart= -p "$ORPH4" | sed 's/^ *//;s/ *$//')" "$(dead_pid2)" > "$SESSION_BUS_DIR/listeners/orphhandle"
+p="$("$BUS" prune)"
+assert_contains "prune releases stale listener locks" "$p" "released @stalehandle"
+assert_contains "prune puts down orphaned listeners"  "$p" "put down @orphhandle"
+[ ! -f "$SESSION_BUS_DIR/listeners/stalehandle" ] && [ ! -f "$SESSION_BUS_DIR/listeners/orphhandle" ] \
+  && pass "prune leaves no listener litter" || fail "prune leaves no listener litter"
+kill -0 "$ORPH4" 2>/dev/null && fail "prune killed the orphaned pipeline" "still running" \
+                             || pass "prune killed the orphaned pipeline"
+assert_contains "nothing left after the listener sweep" "$("$BUS" prune)" "nothing to prune"
+
+# Handles are canonicalized at the door: they live in log address fields,
+# |-delimited roster rows and lock FILENAMES, so anything that would not
+# survive all three verbatim is refused, and case is folded.
+fresh
+out="$("$BUS" join 'bad name' 2>&1)"; rc=$?
+assert_eq       "handle with a space is refused"       "$rc" "1"
+assert_contains "the refusal says what is allowed"     "$out" "invalid handle"
+out="$("$BUS" join 'bad|pipe' 2>&1)"; rc=$?
+assert_eq       "handle with a pipe is refused"        "$rc" "1"
+out="$(CLAUDE_CODE_SESSION_ID=SID-U "$BUS" join ALICE 2>&1)"
+assert_contains "uppercase folds to the canonical form" "$out" "joined as 'alice'"
+out="$("$BUS" listen 'bad name' 2>&1)"; rc=$?
+assert_eq       "listen refuses an invalid handle too" "$rc" "1"
+
+# join and whoami know about the live listener, so their guidance never talks a
+# forgetful session into arming the second Monitor the guard exists to prevent.
+fresh
+CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join gamma >/dev/null 2>&1
+spawn_listener SID-J gamma; LJ=$SPAWNED
+wait_lockfile gamma || fail "listener for the join tests armed" "no lock file appeared"
+out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join gamma 2>&1)"
+assert_contains     "re-join with a live listener warns instead"     "$out" "do NOT arm another Monitor"
+assert_not_contains "re-join with a live listener hides the arm cmd" "$out" "Arm your listener"
+out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join 2>&1)"
+assert_contains "bare re-join reports the existing handle"   "$out" "already joined as 'gamma'"
+assert_eq       "bare re-join mints no suffixed handle" "$(grep -c '^gamma' "$SESSION_BUS_DIR/roster")" "1"
+o="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" whoami 2>&1)"
+assert_contains "whoami shows the running listener"          "$o" "do NOT arm another Monitor"
+# ...and both ask the guard's own per-SESSION question: joining a second handle
+# while the @gamma Monitor runs must not hand out an arm command the guard is
+# guaranteed to refuse.
+out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join delta 2>&1)"
+assert_contains     "join under a second handle names the armed listener" "$out" "listening as @gamma"
+assert_not_contains "and withholds the arm command"                       "$out" "Arm your listener"
+o="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" whoami 2>&1)"
+assert_contains     "whoami flags the cross-handle listener"              "$o" "listening as @gamma"
+CLAUDE_CODE_SESSION_ID=SID-J "$BUS" leave delta >/dev/null 2>&1
+[ -f "$SESSION_BUS_DIR/listeners/gamma" ] && pass "leaving the other handle spares the armed listener" \
+  || fail "leaving the other handle spares the armed listener" "gamma lock is gone"
+kill "$LJ" 2>/dev/null; wait "$LJ" 2>/dev/null
+out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join gamma 2>&1)"
+assert_contains "once the listener stops, join re-arms"      "$out" "Arm your listener"
+out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join 2>&1)"
+assert_contains "bare re-join offers the arm cmd when not listening" "$out" "bus listen gamma"
+
+# ---------------------------------------------------------------------------
 section "help"
 fresh
 h="$("$BUS" help 2>/dev/null)"
@@ -296,7 +499,7 @@ CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice >/dev/null 2>&1
 o="$(CLAUDE_CODE_SESSION_ID=SID-W "$BUS" whoami 2>&1)"
 assert_contains "reports this session's handle" "$o" "@alice"
 assert_contains "says how it matched"           "$o" "matched by session id"
-assert_contains "reprints the listen command"   "$o" "bus-filter alice"
+assert_contains "reprints the listen command"   "$o" "bus listen alice"
 # A sibling session in the same repo must resolve to itself, not its neighbour —
 # the reason whoami keys on session id rather than cwd in the first place.
 CLAUDE_CODE_SESSION_ID=SID-V "$BUS" join alice2 >/dev/null 2>&1

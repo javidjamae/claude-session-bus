@@ -58,8 +58,8 @@ there is no per-session copy to drift. `bus version` says which one.
 
 Two things do lag behind a pull, both runtime state rather than versions:
 
-- **Armed listeners.** A session's Monitor keeps the `bus-filter` process it
-  started with; it picks up filter changes when the listener is re-armed
+- **Armed listeners.** A session's Monitor keeps the `bus listen` process it
+  started with; it picks up code changes when the listener is re-armed
   (next `/session-bus join` — e.g. after a session restart).
 - **Loaded skill instructions.** A long-running session keeps the `SKILL.md` it
   read until `/session-bus` is invoked again.
@@ -111,6 +111,41 @@ session id, or a call from a plain shell, stays freely removable for hand cleanu
 `--by-cwd` — the hook's fallback when no session id is available — additionally
 keeps any row whose process is still alive, unless that process is the session
 currently ending.
+
+### One live listener per session
+
+The mirror-image failure: a session *forgets* it is already listening and arms a
+second Monitor, and now every `@mention` wakes it twice, forever, with nothing
+anywhere to say why. Advice can't fix forgetting, so the listener enforces it.
+The Monitor command is `bus listen <handle>` — the `tail -F | bus-filter`
+pipeline wrapped in a guard that records who is listening (in
+`~/.claude/session-bus/listeners/`) and refuses to start a duplicate:
+
+```bash
+./bus listen alice
+# error: this session is ALREADY listening as @alice (pid 17561).
+#        Do NOT arm a second Monitor — the existing one is still delivering.
+```
+
+The same guard covers a second handle (one Monitor per session, so a forgetful
+re-join under a new name can't double-subscribe either) and a handle another
+live session is tailing. `join` cooperates from its side: a bare `join` from a
+session that is already registered reports the handle it holds instead of
+minting a suffixed one, and a re-join while your listener is live says so
+instead of re-printing the arm instruction.
+
+The refusal is keyed to *live* listeners only, by the same pid + start-time
+proof the roster uses. A listener whose process is gone never blocks anyone; an
+orphan — still tailing, but its session's process is dead, so it delivers to
+nobody — is put down by the next `bus listen` (any handle) or `bus prune`. A
+graceful stop (TaskStop, session end) removes its own lock on the way out, and
+`bus leave` stops the leaving session's listener too, so a handed-over handle
+is never stranded behind its previous owner's Monitor.
+
+One caveat on upgrade: listeners armed before this guard existed hold no lock,
+so the guard cannot see them. Re-arm each session once — TaskStop the old
+Monitor, `/session-bus join`, arm the printed command — and everything from
+then on is covered.
 
 ### What `SessionEnd` actually covers
 
@@ -167,6 +202,7 @@ reads later as though the process table had proven something.
 **Or use the CLI directly** (it's just `bus`):
 ```bash
 ./bus join alice          # registers + prints your Monitor listen command
+./bus listen alice        # what the Monitor runs (blocks; refuses a duplicate listener)
 ./bus send alice @bob "want to pair on the payments PR?"
 ./bus whoami              # the handle THIS session is registered as
 ./bus who                 # who's registered (reaps handles whose process is gone)
@@ -243,7 +279,10 @@ liveness flagging, session-id-keyed auto-leave (including the sibling-session an
 ambiguous-cwd cases), `prune`'s pid reaper (dead pid, recycled pid, silent-but-live
 session, pid-less row), `prune --force`, handle ownership (a taken name refused
 with a suffix suggestion, a restart still reclaiming its own name, and removal
-refusing to evict another session unless forced), the `SessionEnd` hook, and the `install.sh` settings.json
+refusing to evict another session unless forced), the listener guard (duplicate
+and second-handle listeners refused, stale locks ignored, orphans replaced and
+killed, a graceful stop releasing its slot, and `join`/`whoami` reporting a
+running listener instead of re-printing the arm command), the `SessionEnd` hook, and the `install.sh` settings.json
 merge — which runs against a throwaway `$HOME`, so your real settings are never
 touched either.
 
