@@ -10,7 +10,7 @@ set -uo pipefail
 # Bumped on releases; `bus version` appends the git commit when run from a
 # checkout, which is the precise answer — the skill install is a symlink, so
 # whatever the checkout has IS what every session runs.
-BUS_VERSION="0.2.1"
+BUS_VERSION="0.3.0"
 
 BUS_DIR="${SESSION_BUS_DIR:-$HOME/.claude/session-bus}"
 LOG="$BUS_DIR/bus.log"
