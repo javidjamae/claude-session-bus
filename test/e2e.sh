@@ -186,8 +186,12 @@ n="$(grep -cF "first through bus wait" "$WOUT")"
 c="$("$BUS" catchup alice)"
 case "$c" in *"(nothing new)"*) pass "what bus wait delivered is marked seen for catchup";;
              *) fail "what bus wait delivered is marked seen for catchup" "got [$c]";; esac
-[ -s "$TMP/wait.err" ] && fail "the waits ran without errors" "$(head -2 "$TMP/wait.err")" \
-                       || pass "the waits ran without errors"
+# A run with no session id and no Claude process (CI) is told, correctly, that
+# the listener cannot be attributed to a session. Anything else on stderr is a
+# real error.
+werr="$(grep -v 'cannot attribute this listener to a session' "$TMP/wait.err")"
+[ -n "$werr" ] && fail "the waits ran without errors" "$(printf '%s\n' "$werr" | head -2)" \
+               || pass "the waits ran without errors"
 
 # ---------------------------------------------------------------------------
 section "blob round-trip and catchup across a restart"
