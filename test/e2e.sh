@@ -26,6 +26,7 @@ TMP="$(mktemp -d)"
 CLONE="$TMP/clone"
 export SESSION_BUS_DIR="$TMP/bus"
 LISTEN_PID=""
+WAIT_PID=""
 # `bus listen` owns its two pipeline stages and kills them from its own exit
 # trap on TERM — that cleanup is part of what this battery proves. The escalation
 # to -9 is only so a regression in that trap fails an assertion instead of
@@ -41,7 +42,7 @@ stop_listener() {
   LISTEN_PID=""
   return 0
 }
-cleanup() { stop_listener; rm -rf "$TMP"; return 0; }
+cleanup() { stop_listener; [ -n "$WAIT_PID" ] && kill "$WAIT_PID" 2>/dev/null; rm -rf "$TMP"; return 0; }
 trap cleanup EXIT
 
 PASS=0; FAIL=0
@@ -129,6 +130,64 @@ stop_listener
                          || pass "listener ran without errors"
 [ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "a stopped listener releases its lock" "lock survived" \
                                           || pass "a stopped listener releases its lock"
+
+# ---------------------------------------------------------------------------
+section "live delivery through bus wait (the listener a session arms)"
+# What a session actually runs: `bus wait alice` as a background command that
+# exits on delivery, re-armed after each message. The gap between one exit and
+# the next arm is the whole risk, so that is what gets driven here.
+WOUT="$TMP/alice.wait"
+: > "$WOUT"
+arm_wait() {
+  CLAUDE_CODE_SESSION_ID=e2e-alice SESSION_BUS_WAIT_POLL=0.2 "$BUS" wait alice >>"$WOUT" 2>>"$TMP/wait.err" &
+  WAIT_PID=$!
+}
+# Reap the wait and report its exit status; a wait that never exits is killed
+# after 10s so it fails an assertion instead of hanging the battery.
+reap_wait() {
+  _i=0
+  while kill -0 "$WAIT_PID" 2>/dev/null && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i+1)); done
+  kill -9 "$WAIT_PID" 2>/dev/null
+  wait "$WAIT_PID" 2>/dev/null; _rc=$?
+  WAIT_PID=""
+  return "$_rc"
+}
+wait_armed() { # until the wait holds alice's lock
+  _i=0
+  while [ ! -s "$SESSION_BUS_DIR/listeners/alice" ] && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i+1)); done
+  [ -s "$SESSION_BUS_DIR/listeners/alice" ]
+}
+# Arming is "catchup, then wait": bus listen above delivered live without
+# touching the read cursor, and catchup is what squares that away.
+"$BUS" catchup alice >/dev/null 2>&1
+arm_wait
+wait_armed && pass "bus wait registers as the handle's listener" \
+           || fail "bus wait registers as the handle's listener" "no lock file in 10s"
+"$BUS" send bob @alice "first through bus wait" >/dev/null
+wait_for "$WOUT" "first through bus wait" && pass "a mention is delivered by the armed wait" \
+  || fail "a mention is delivered by the armed wait" "nothing arrived in 10s"
+reap_wait; rc=$?
+[ "$rc" = "0" ] && pass "the wait exits 0 on delivery (that exit is what re-invokes the session)" \
+                || fail "the wait exits 0 on delivery (that exit is what re-invokes the session)" "rc $rc"
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "the exited wait frees the listener slot" "lock survived" \
+                                          || pass "the exited wait frees the listener slot"
+
+# Nothing is armed right now — the window a time-capped Monitor turns into a
+# blind spot, and the one a cursor-based wait has to make harmless.
+"$BUS" send bob @alice "sent while nothing was armed" >/dev/null
+arm_wait
+wait_for "$WOUT" "sent while nothing was armed" && pass "a message sent between two waits is delivered by the next one" \
+  || fail "a message sent between two waits is delivered by the next one" "nothing arrived in 10s"
+reap_wait; rc=$?
+[ "$rc" = "0" ] && pass "the re-armed wait exits 0 too" || fail "the re-armed wait exits 0 too" "rc $rc"
+n="$(grep -cF "first through bus wait" "$WOUT")"
+[ "$n" = "1" ] && pass "what one wait delivered, the next does not repeat" \
+               || fail "what one wait delivered, the next does not repeat" "seen $n times"
+c="$("$BUS" catchup alice)"
+case "$c" in *"(nothing new)"*) pass "what bus wait delivered is marked seen for catchup";;
+             *) fail "what bus wait delivered is marked seen for catchup" "got [$c]";; esac
+[ -s "$TMP/wait.err" ] && fail "the waits ran without errors" "$(head -2 "$TMP/wait.err")" \
+                       || pass "the waits ran without errors"
 
 # ---------------------------------------------------------------------------
 section "blob round-trip and catchup across a restart"

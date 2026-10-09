@@ -16,7 +16,8 @@ Claude Code's built-in multi-agent features (subagents, agent teams) coordinate 
 
 - **One shared append-only log** at `~/.claude/session-bus/bus.log`.
 - **`@mention` addressing.** Messages look like `[alice 08-03 14:20] @bob ship it`. `@all` broadcasts.
-- **The trick:** each session's listener is `tail -F bus.log | grep '@yourhandle'`, so the OS filters at the pipe — a session is **only ever woken when actually tagged**. Untagged messages never reach it.
+- **The trick:** each session's listener is a plain shell command watching the log for its own `@handle` — the filtering happens outside the model, so a session is **only ever woken when actually tagged**. Untagged messages never reach it.
+- **A listener that cannot expire.** `bus wait <handle>` blocks until the handle is tagged, prints the message and exits. Run as a background command it has no time limit, and its exit is what wakes the session — which handles the message and arms the next one. See [Listening](#listening).
 - **Full context on demand.** Because it's one shared log, any session can `bus log` to read the whole thread, tagged or not.
 - **Any-to-any.** No hub, no daemon, no network. Just a file and `tail`/`grep`.
 - **Self-cleaning roster.** A `SessionEnd` hook deregisters a session when it ends, and a pid liveness check reaps whatever the hook couldn't (`kill -9`, crashes) — so `bus who` shows who's actually there.
@@ -58,9 +59,10 @@ there is no per-session copy to drift. `bus version` says which one.
 
 Two things do lag behind a pull, both runtime state rather than versions:
 
-- **Armed listeners.** A session's Monitor keeps the `bus listen` process it
-  started with; it picks up code changes when the listener is re-armed
-  (next `/session-bus join` — e.g. after a session restart).
+- **Armed listeners.** A running `bus wait` (or `bus listen`) keeps the code it
+  started with; it picks up changes the next time it is armed — for `bus wait`
+  that is after the next message, since every delivery ends one wait and starts
+  another.
 - **Loaded skill instructions.** A long-running session keeps the `SKILL.md` it
   read until `/session-bus` is invoked again.
 
@@ -115,36 +117,38 @@ currently ending.
 ### One live listener per session
 
 The mirror-image failure: a session *forgets* it is already listening and arms a
-second Monitor, and now every `@mention` wakes it twice, forever, with nothing
+second listener, and now every `@mention` wakes it twice, forever, with nothing
 anywhere to say why. Advice can't fix forgetting, so the listener enforces it.
-The Monitor command is `bus listen <handle>` — the `tail -F | bus-filter`
-pipeline wrapped in a guard that records who is listening (in
-`~/.claude/session-bus/listeners/`) and refuses to start a duplicate:
+Both listeners — `bus wait <handle>` and the streaming `bus listen <handle>` —
+start behind one guard that records who is listening (in
+`~/.claude/session-bus/listeners/`) and refuses to start a duplicate, of either
+kind:
 
 ```bash
-./bus listen alice
+./bus wait alice
 # error: this session is ALREADY listening as @alice (pid 17561).
-#        Do NOT arm a second Monitor — the existing one is still delivering.
+#        Do NOT arm a second listener — the existing one is still delivering.
 ```
 
-The same guard covers a second handle (one Monitor per session, so a forgetful
+The same guard covers a second handle (one listener per session, so a forgetful
 re-join under a new name can't double-subscribe either) and a handle another
-live session is tailing. `join` cooperates from its side: a bare `join` from a
+live session is listening on. `join` cooperates from its side: a bare `join` from a
 session that is already registered reports the handle it holds instead of
 minting a suffixed one, and a re-join while your listener is live says so
 instead of re-printing the arm instruction.
 
 The refusal is keyed to *live* listeners only, by the same pid + start-time
 proof the roster uses. A listener whose process is gone never blocks anyone; an
-orphan — still tailing, but its session's process is dead, so it delivers to
-nobody — is put down by the next `bus listen` (any handle) or `bus prune`. A
-graceful stop (TaskStop, session end) removes its own lock on the way out, and
-`bus leave` stops the leaving session's listener too, so a handed-over handle
-is never stranded behind its previous owner's Monitor.
+orphan — still running, but its session's process is dead, so it delivers to
+nobody — is put down by the next `bus wait` or `bus listen` (any handle) or
+`bus prune`. A listener that exits (a `bus wait` that has delivered, a TaskStop,
+session end) removes its own lock on the way out, so the slot is free for the
+next wait at once, and `bus leave` stops the leaving session's listener too, so
+a handed-over handle is never stranded behind its previous owner's.
 
 One caveat on upgrade: listeners armed before this guard existed hold no lock,
 so the guard cannot see them. Re-arm each session once — TaskStop the old
-Monitor, `/session-bus join`, arm the printed command — and everything from
+listener, `/session-bus join`, arm the printed command — and everything from
 then on is covered.
 
 ### What `SessionEnd` actually covers
@@ -201,8 +205,10 @@ reads later as though the process table had proven something.
 
 **Or use the CLI directly** (it's just `bus`):
 ```bash
-./bus join alice          # registers + prints your Monitor listen command
-./bus listen alice        # what the Monitor runs (blocks; refuses a duplicate listener)
+./bus join alice          # registers + prints the command that arms your listener
+./bus wait alice          # the listener: blocks until alice is tagged, prints it, exits 0
+./bus wait alice --timeout 600   # ...or exits 124 after 10 minutes with nothing to show
+./bus listen alice        # the streaming listener, for a Monitor (never exits on its own)
 ./bus send alice @bob "want to pair on the payments PR?"
 ./bus whoami              # the handle THIS session is registered as
 ./bus who                 # who's registered (reaps handles whose process is gone)
@@ -217,6 +223,60 @@ reads later as though the process table had proven something.
 ./bus leave --force alice # ...even if the row belongs to another session
 ```
 
+## Listening
+
+A session listens by running one command in the background:
+
+```bash
+./bus wait alice
+# [bob 08-05 12:21] @alice :: want to pair on the payments PR?
+# (exit 0)
+```
+
+`bus wait` blocks until a line tags the handle (or `@all`), prints every unseen
+mention in the log's own format, marks them seen, and exits. That exit is the
+wake-up: Claude Code re-invokes a session when one of its background commands
+finishes. The session handles the message and arms the next wait.
+
+It is one-shot because a listener that must stay armed is only as durable as
+whatever arms it. A Monitor running `bus listen` works until the Monitor's time
+limit, and then the session is deaf — with nothing wrong on the bus — until
+something makes it re-arm. A background command has no time limit, so a wait
+that is re-armed on every delivery never has a moment where it has expired.
+
+**Nothing is lost between two waits.** A wait does not listen "from now": it
+starts at the handle's [read cursor](#catchup-is-a-cursor-not-a-clock), the same
+one `catchup` advances, so a message that lands while nothing is armed is the
+first thing the next wait finds. It prints before it advances the cursor, so a
+wait that dies at the wrong instant shows a message twice rather than dropping
+it once — the same bias as everywhere else here.
+
+| exit | means |
+| --- | --- |
+| `0` | mentions were printed and marked seen |
+| `124` | `--timeout <seconds>` passed with nothing to show (`--timeout 0` looks once and never blocks) |
+| anything else | nothing was delivered and nothing was marked seen — refused as a duplicate, stopped by `bus leave` or a TaskStop (`143`), or orphaned |
+
+A few deliberate choices:
+
+- **A poll, not a pipeline.** The wait checks the log's size every two seconds
+  (`SESSION_BUS_WAIT_POLL`) and reads only the bytes that are new. A
+  `tail -F | filter` pipeline reacts faster, but leaves both stages running if
+  its parent is killed with `SIGKILL` — and a listener that is re-armed after
+  every message would leak a pair each time that happened. A loop with no
+  children has nothing to leak.
+- **It does not outlive its session.** A wait whose Claude Code process is gone
+  exits on its own, and refuses to deliver in the meantime: printing mail to
+  nobody and then marking it seen would hide it from the `catchup` of whichever
+  session takes the handle next.
+- **Whole lines only.** A line caught mid-append is left for the next look, and
+  the cursor never rests anywhere but a line boundary.
+
+`bus listen <handle>` remains as the streaming form — every mention, never
+exiting — for a harness whose Monitor can stay armed for the whole session. It
+delivers without touching the read cursor, so run `bus catchup` when moving from
+it to `bus wait`.
+
 ## Catchup is a cursor, not a clock
 
 `catchup` answers "what did I miss while I was gone?" — exactly, with no window
@@ -224,9 +284,11 @@ to tune and no cap on what it will show. Each handle carries a **read cursor**: 
 byte offset into the append-only log, in `~/.claude/session-bus/cursors/<handle>`.
 Catchup is then just "the rest of the file, filtered to my mentions."
 
-Two things advance the cursor:
+Three things advance the cursor:
 
 - **`catchup` itself**, once it has shown you the messages.
+- **`bus wait`**, once it has printed them. It reads from the cursor rather than
+  from "now", which is what makes re-arming it lossless.
 - **A graceful leave.** Your listener is armed right up to the moment your session
   ends, so everything logged before that was delivered live. The gap starts
   exactly there, which is why the cursor is keyed on your session ending rather
@@ -268,6 +330,7 @@ touched:
 
 ```bash
 ./test/run.sh     # prints PASS/FAIL per assertion; exits non-zero on any failure
+./test/e2e.sh     # the real listeners, armed for real, from a fresh clone
 ```
 
 Covers stamp format, `send` validation, `bus-filter` addressing (direct /
@@ -282,7 +345,10 @@ with a suffix suggestion, a restart still reclaiming its own name, and removal
 refusing to evict another session unless forced), the listener guard (duplicate
 and second-handle listeners refused, stale locks ignored, orphans replaced and
 killed, a graceful stop releasing its slot, and `join`/`whoami` reporting a
-running listener instead of re-printing the arm command), the `SessionEnd` hook, and the `install.sh` settings.json
+running listener instead of re-printing the arm command), `bus wait` (mail
+already waiting, mail sent between two waits, a half-written line, a truncated
+log, `--timeout`, the shared guard, `leave` stopping it, and an orphaned wait
+declining to mark mail seen), the `SessionEnd` hook, and the `install.sh` settings.json
 merge — which runs against a throwaway `$HOME`, so your real settings are never
 touched either.
 
@@ -306,10 +372,11 @@ pays for delivery in a way a file doesn't:
 - **Idle sessions cost nothing here.** A server-backed bus has to *tell* a
   session it has mail, and MCP is request/response from the client side — so the
   session either polls (`check_messages` every turn) or blocks waiting. Both burn
-  turns to learn that nothing happened. `tail -F | grep '@handle'` inverts it:
-  the kernel does the filtering, untagged traffic never reaches the session at
-  all, and a tagged message wakes it the moment it lands. Leaving four sessions
-  listening all day is free.
+  turns to learn that nothing happened. A shell command watching the file inverts
+  it: the filtering happens outside the model, untagged traffic never reaches
+  the session at all, and a tagged message wakes it within a couple of seconds
+  of landing. Leaving four sessions listening all day costs no turns and no
+  tokens — only a size check on one file every two seconds each.
 - **One log beats N channels.** Channel- or mailbox-scoped buses fragment the
   conversation: you only see what was addressed to you. Because everything lands
   in one append-only file, `bus log` and `bus catchup` give any session the whole
