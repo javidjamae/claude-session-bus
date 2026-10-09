@@ -136,7 +136,8 @@ assert_contains     "catchup advances the cursor"         "$("$BUS" catchup alic
 # the next session sees the gap and only the gap: the whole point of keying on
 # leave rather than on a clock.
 "$BUS" listen alice >/dev/null 2>&1 &
-LISTEN_PIDS="$LISTEN_PIDS $!"
+STREAMER=$!
+LISTEN_PIDS="$LISTEN_PIDS $STREAMER"
 _i=0; while [ ! -s "$SESSION_BUS_DIR/listeners/alice" ] && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i+1)); done
 "$BUS" send bob @alice "seen live before leaving" >/dev/null
 "$BUS" leave alice >/dev/null
@@ -149,6 +150,11 @@ assert_not_contains "rejoin does not reset an existing cursor" "$g" "first unrea
 # With NO streaming listener, nothing delivered that mail live, so a leave has
 # nothing to record. Marking the log read here is how a session that used
 # `bus wait` would lose whatever landed after its last wait exited.
+# The listener is stopped by hand first: the leave above only stops it when it
+# can tell the listener is its own, and a run with no session id and no Claude
+# process (CI) cannot — there it is still streaming, and still delivering.
+kill "$STREAMER" 2>/dev/null; wait "$STREAMER" 2>/dev/null
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "the streaming listener is down before the no-listener case" "lock survived"
 "$BUS" send bob @alice "landed with nothing listening" >/dev/null
 "$BUS" leave alice >/dev/null
 "$BUS" join alice >/dev/null 2>&1
