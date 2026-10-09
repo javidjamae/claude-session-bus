@@ -39,26 +39,97 @@ now_minus_hours() {
 # guess wrong in both directions (a long absence loses messages past the edge, a
 # busy day gets truncated).
 #
-# The offset is advanced by `catchup` itself and by a *graceful* leave (at which
-# point the session's listener had been armed the whole time, so the log really
-# was delivered live). It is deliberately NOT advanced when `prune` reaps a
-# hard-killed session: we cannot know when that session stopped reading, so its
-# successor re-sees some already-delivered messages. Every ambiguity here
-# resolves toward showing a message twice rather than dropping it once.
+# The offset is advanced by whatever has actually SHOWN the mail: `catchup`,
+# `bus wait`, and a graceful leave made while a streaming `bus listen` is still
+# running (that listener delivers live without touching the cursor, so the
+# leave is the moment to record that the log was read). A leave with no
+# streaming listener leaves the cursor alone: `bus wait` keeps it exact on its
+# own, and mail that landed between two waits has been shown to nobody. It is
+# also deliberately NOT advanced when `prune` reaps a hard-killed session: we
+# cannot know when that session stopped reading, so its successor re-sees some
+# already-delivered messages. Every ambiguity here resolves toward showing a
+# message twice rather than dropping it once.
 
 log_size() { wc -c <"$LOG" 2>/dev/null | tr -d ' '; }
 
 handle_slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_-' '-'; }
 cursor_file() { printf '%s/%s' "$CURSORS" "$(handle_slug "$1")"; }
 cursor_get()  { _cf="$(cursor_file "$1")"; [ -f "$_cf" ] || return 1; cat "$_cf" 2>/dev/null; }
+# Written whole or not at all (temp file + rename). A reader that caught a
+# plain `>` between its truncate and its write would see an empty cursor, and
+# an empty cursor reads as "no cursor": start from the end, mail skipped.
+cursor_write() { # <file> <offset>
+  printf '%s\n' "$2" >"$1.$$" 2>/dev/null && mv -f "$1.$$" "$1" 2>/dev/null
+}
 # Monotonic: a stale writer (an old session leaving late) must never rewind a
 # cursor that a live session has already advanced past.
 cursor_set() {
   _cf="$(cursor_file "$1")"; _cur="$(cat "$_cf" 2>/dev/null)"
   case "${_cur:-}" in ''|*[!0-9]*) _cur=0;; esac
   case "${2:-}" in ''|*[!0-9]*) return 0;; esac
-  [ "$2" -gt "$_cur" ] && printf '%s\n' "$2" >"$_cf"
+  [ "$2" -gt "$_cur" ] && cursor_write "$_cf" "$2"
   return 0
+}
+# The one sanctioned rewind: a cursor past the end of the log points into a file
+# that no longer exists (the log was truncated or replaced), so the offset means
+# nothing. Left in place it would outrank every later cursor_set — and each
+# catchup would replay the whole log again, forever.
+cursor_rewind() { cursor_write "$(cursor_file "$1")" "$2"; }
+
+# Raw log bytes [from, to). Both ends are byte offsets, so a reader that
+# snapshots the size once sees exactly that much and nothing appended after it.
+log_window() { # <from> <to>
+  [ "$2" -gt "$1" ] || return 0   # BSD head rejects a zero count
+  tail -c "+$(( $1 + 1 ))" "$LOG" 2>/dev/null | head -c "$(( $2 - $1 ))"
+}
+
+# The offset just past the last WHOLE line in [from, to). A cursor must only
+# ever rest on a line boundary: a reader that catches a writer mid-append and
+# steps over the half line would never be shown the message it belongs to.
+whole_lines_end() { # <from> <to>
+  _wl_n="$(log_window "$1" "$2" | wc -l | tr -d ' ')"
+  case "${_wl_n:-}" in ''|0|*[!0-9]*) printf '%s' "$1"; return 0;; esac
+  _wl_b="$(log_window "$1" "$2" | head -n "$_wl_n" | wc -c | tr -d ' ')"
+  case "${_wl_b:-}" in ''|*[!0-9]*) _wl_b=0;; esac
+  printf '%s' "$(( $1 + _wl_b ))"
+}
+
+# The offset just past the last whole line of the log as it stands: "the end",
+# for anything that parks a cursor there (join's seed, a leave). Almost always
+# simply the size; only a writer caught mid-append makes the two differ, and a
+# log line is far shorter than the 64K this looks back over.
+log_boundary() {
+  _lb_size="$(log_size)"
+  case "${_lb_size:-}" in ''|0|*[!0-9]*) printf '0'; return 0;; esac
+  # $(...) strips a trailing newline, so empty means the last byte IS one.
+  if [ -z "$(log_window "$(( _lb_size - 1 ))" "$_lb_size")" ]; then printf '%s' "$_lb_size"; return 0; fi
+  _lb_from=$(( _lb_size > 65536 ? _lb_size - 65536 : 0 ))
+  whole_lines_end "$_lb_from" "$_lb_size"
+}
+
+# The mentions of <handle> in log bytes [from, to), as bus-filter prints them.
+# Returns the FILTER's status: "matched nothing" and "could not run" both print
+# nothing, and a caller that cannot tell them apart would step the cursor over
+# mail it never showed.
+unseen_mentions() { # <handle> <from> <to>
+  log_window "$2" "$3" | "$SELF_DIR/bus-filter" "$1"
+  return "${PIPESTATUS[1]}"
+}
+
+# The one canonical form of a handle, or rc 1 with the reason on stderr.
+# Handles live in log address fields, |-delimited roster rows, and lock/cursor
+# FILENAMES — so a handle is folded to lowercase (every matcher is
+# case-insensitive anyway) and anything that would not survive all three
+# verbatim is refused. Two distinct raw handles that slug to one filename would
+# otherwise share a listener lock and hard-refuse each other.
+canon_handle() { # <raw>
+  _ch="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$_ch" in
+    ''|*[!a-z0-9_-]*)
+      echo "error: invalid handle '$1' — use letters, digits, '-' and '_' only." >&2
+      return 1;;
+  esac
+  printf '%s' "$_ch"
 }
 
 # --- blobs ------------------------------------------------------------------
@@ -94,10 +165,20 @@ EOF
   return 0
 }
 
-# Print the exact Monitor listen command for a handle. `bus listen` runs the
-# tail|bus-filter pipeline (address-field matching, no self-echo) wrapped in a
-# duplicate-listener guard, so a session that forgets it is already listening
-# and arms a second Monitor gets an immediate refusal instead of double delivery.
+# Print the exact command that arms a handle's listener. `bus wait` blocks until
+# the handle is next tagged, prints the message and exits — so it is armed as a
+# background command (which has no time limit) and re-armed after each message.
+# It sits behind the same duplicate-listener guard as `bus listen`, so a session
+# that forgets it is already armed gets an immediate refusal instead of double
+# delivery.
+arm_cmd() {
+  printf '%s/bus wait %s\n' "$SELF_DIR" "$1"
+}
+# How to run it, said the same way everywhere the arm command is handed out.
+ARM_HOW="run it in the background (Bash tool, run_in_background); it exits when you are tagged — handle the message, then run it again"
+
+# The streaming alternative: the tail|bus-filter pipeline (address-field
+# matching, no self-echo), for a harness whose Monitor can stay armed.
 listen_cmd() {
   printf '%s/bus listen %s\n' "$SELF_DIR" "$1"
 }
@@ -216,16 +297,21 @@ lock() {
   trap unlock EXIT
 }
 
-# Deregister one handle: drop from roster, note it in the log, mark the log
-# read, and put down this session's listener for the handle (a leave that
-# walks away from a live listener strands the handle for its next owner).
-# The cursor advance is what makes the *next* session's catchup exact: this
-# session listened right up to this instant, so the gap starts here and nowhere
-# else. Only graceful endings get this — see the read-cursor notes above.
+# Deregister one handle: drop from roster, note it in the log, and put down
+# this session's listener for the handle (a leave that walks away from a live
+# listener strands the handle for its next owner).
+#
+# The log is marked read here ONLY when a streaming `bus listen` is live for
+# the handle: that listener delivered everything up to this instant without
+# ever touching the cursor, so the gap starts here and nowhere else. With no
+# streaming listener there is nothing to record — `bus wait` advances the
+# cursor itself as it delivers — and advancing anyway would mark as seen the
+# mail that landed since the last wait exited, which nobody has been shown.
+# The check comes before the listener is released, while it can still be seen.
 do_leave() { # <handle> [owner_sid] [force]
   roster_drop "$1"
   printf '[%s %s] offline\n' "$1" "$(now)" >>"$LOG"
-  cursor_set "$1" "$(log_size)"
+  streaming_listener_live "$1" && cursor_set "$1" "$(log_boundary)"
   release_listener "$1" "${2:-${CLAUDE_CODE_SESSION_ID:-}}" "$(claude_pid)" "${3:-}"
 }
 
@@ -242,6 +328,26 @@ row_field() { awk -F'|' -v hh="$1" -v n="$2" 'tolower($1)==tolower(hh) { print $
 # Is this row's recorded process still the one that registered it?
 row_alive() { pid_alive "$(row_field "$1" 5)" "$(row_field "$1" 6)"; }
 
+# Is <handle> registered to a LIVE session other than <my_sid>? Prints that
+# session's id. Reading a handle's mail advances its cursor, so it is only for
+# the session that holds the handle: a displaced session that kept reading
+# would eat the new holder's mail without ever showing it to them. Only judged
+# when both sides identify themselves, as everywhere else — an unregistered
+# handle or a call from a plain shell is nobody's to protect. Whether the
+# registered session is still alive is not this function's question: `join` is
+# where a name changes hands, and it already knows when a takeover is allowed.
+foreign_holder() { # <handle> <my_sid>
+  _fh_sid="$(row_field "$1" 4)"
+  [ -n "${_fh_sid:-}" ] && [ -n "${2:-}" ] && [ "$_fh_sid" != "$2" ] || return 1
+  printf '%s' "$_fh_sid"
+}
+refuse_foreign() { # <handle> <my_sid> <what> — exits 1 if the handle is someone else's
+  _rf_owner="$(foreign_holder "$1" "$2")" || return 0
+  echo "error: @$1 is registered to a different session ($_rf_owner), not this one — $3." >&2
+  echo "       'bus whoami' shows the handle this session holds; 'bus join $1' takes this one if its session is gone." >&2
+  exit 1
+}
+
 # --- listener locks ---------------------------------------------------------
 # One live listener per session — enforced, not requested. A session that
 # forgets it is already listening and arms a second Monitor used to get every
@@ -252,6 +358,16 @@ row_alive() { pid_alive "$(row_field "$1" 5)" "$(row_field "$1" 6)"; }
 # a lock whose listener process is gone is stale and never blocks anyone.
 
 listener_file() { printf '%s/%s' "$LISTENERS" "$(handle_slug "$1")"; }
+
+# Is a streaming `bus listen` live for this handle right now? Told apart from a
+# `bus wait` by its fifo — the lock line is the same for both, and stays that
+# way so listeners armed by older code keep reading it.
+streaming_listener_live() { # <handle>
+  _sv_f="$(listener_file "$1")"
+  [ -f "$_sv_f" ] || return 1
+  IFS='|' read -r _sv_pid _sv_pstart _sv_rest <"$_sv_f" 2>/dev/null
+  pid_alive "${_sv_pid:-}" "${_sv_pstart:-}" && [ -p "$LISTENERS/.fifo.$_sv_pid" ]
+}
 
 # Do these two identities belong to the same Claude session? Session-id
 # evidence decides whenever both sides carry one — the id is what defines a
@@ -352,8 +468,75 @@ release_listener() { # <handle> <my_sid> <my_cpid> [force]
   fi
   if [ -n "${4:-}" ] || same_session "${_re_sid:-}" "${_re_cpid:-}" "${2:-}" "${3:-}"; then
     reap_listener_lock "$_re_f" "$_re_pid"
-    printf 'stopped the @%s listener (pid %s) — its Monitor will report the command exited\n' "$1" "$_re_pid"
+    printf 'stopped the @%s listener (pid %s) — the task that armed it will report the command exited\n' "$1" "$_re_pid"
   fi
+  return 0
+}
+
+# Claim <handle>'s listener slot for this process, or refuse and exit 1. Shared
+# by `bus listen` and `bus wait`: both deliver a handle's mail to a session, so
+# a session running either must not be able to start the other. The guard has
+# to live HERE, at the moment the second listener would start — join can advise
+# a forgetful session all it likes, but only the listener itself can make the
+# duplicate fail instead of half-working (every message delivered twice,
+# forever, silently).
+listener_claim() { # <handle> <my_sid> <my_cpid> <my_cstart>
+  _cl_lf="$(listener_file "$1")"
+  [ -n "${2:-}${3:-}" ] || echo "warning: cannot attribute this listener to a session (no session id, no Claude process) — the one-listener-per-session rule cannot protect it." >&2
+  lock
+  # Clear the provably-dead first: stale locks (SIGKILLed listeners) and
+  # orphans (listeners whose session's process is gone) — including orphans
+  # under OTHER handles, or a crashed session's listener would leak until
+  # someone happened to reuse its exact handle.
+  _cl_swept="$(listener_sweep)"
+  [ -n "$_cl_swept" ] && printf '%s\n' "$_cl_swept" | sed 's/^/note: /' >&2
+  # Then judge the survivors — all provably live, owner alive or unknown.
+  # Classify them ALL before refusing: the same-session verdict must win over
+  # the foreign-holder one, or which refusal (and which remedy) the user sees
+  # would depend on lock-filename collation order, and a session could be told
+  # to kill a healthy peer's listener instead of hearing about its own.
+  _cl_same=""; _cl_other=""; _cl_other_pid=""; _cl_foreign=""
+  for _cl_f in "$LISTENERS"/*; do
+    [ -f "$_cl_f" ] || continue
+    IFS='|' read -r _cl_pid _cl_pstart _cl_cpid _cl_cstart _cl_sid _cl_h <"$_cl_f"
+    [ -n "${_cl_h:-}" ] || _cl_h="${_cl_f##*/}"
+    pid_alive "${_cl_pid:-}" "${_cl_pstart:-}" || continue
+    if same_session "${_cl_sid:-}" "${_cl_cpid:-}" "${2:-}" "${3:-}"; then
+      if [ "$_cl_f" = "$_cl_lf" ]; then _cl_same="$_cl_pid"; else _cl_other="$_cl_h"; _cl_other_pid="$_cl_pid"; fi
+    elif [ "$_cl_f" = "$_cl_lf" ]; then
+      _cl_foreign="$_cl_pid"
+    fi
+  done
+  if [ -n "$_cl_same" ]; then
+    unlock
+    echo "error: this session is ALREADY listening as @$1 (pid $_cl_same)." >&2
+    echo "       Do NOT arm a second listener — the existing one is still delivering." >&2
+    exit 1
+  fi
+  if [ -n "$_cl_other" ]; then
+    unlock
+    echo "error: this session already has a live listener as @$_cl_other (pid $_cl_other_pid) — one listener per session." >&2
+    echo "       Stop that one (TaskStop its task, and 'bus leave $_cl_other' if renaming) before listening as @$1." >&2
+    exit 1
+  fi
+  if [ -n "$_cl_foreign" ]; then
+    unlock
+    echo "error: a live listener for @$1 is already armed by a different session (pid $_cl_foreign)." >&2
+    echo "       Two listeners on one handle deliver every message twice. If that listener is truly dead, kill pid $_cl_foreign and retry." >&2
+    exit 1
+  fi
+  printf '%s|%s|%s|%s|%s|%s\n' "$$" "$(proc_start "$$")" "${3:-}" "${4:-}" "${2:-}" "$1" >"$_cl_lf"
+  unlock
+}
+
+# Take the lock down on the way out — but only if it is still OURS: a listener
+# being put down by a successor must not delete the fresh lock that successor
+# just wrote.
+listener_unclaim() { # <handle>
+  _uc_lf="$(listener_file "$1")"
+  [ -f "$_uc_lf" ] || return 0
+  IFS='|' read -r _uc_pid _uc_rest <"$_uc_lf" 2>/dev/null
+  [ "${_uc_pid:-}" = "$$" ] && rm -f "$_uc_lf"
   return 0
 }
 
@@ -389,7 +572,7 @@ usage() {
 bus — local coordination for Claude Code sessions
 
   bus help                       this list
-  bus join [handle]              register + print your Monitor listen command
+  bus join [handle]              register + print the command that arms your listener
                                  (no handle => a slug of the current directory;
                                  a handle a live session already holds is refused)
   bus whoami                     the handle THIS session is registered as
@@ -403,9 +586,18 @@ bus — local coordination for Claude Code sessions
   bus get <key>                  print a stored payload
   bus prune [--force]            drop handles whose process is gone; sweep old blobs
                                  (--force also drops rows that recorded no pid)
-  bus listen <handle>            run the listener a Monitor arms (blocks; refuses to
-                                 start when this session already has a live listener)
-  bus listen-cmd <handle>        reprint the Monitor listen command
+  bus wait <handle> [--timeout <seconds>]
+                                 the listener to arm: block until you are next tagged,
+                                 print what arrived, mark it seen, exit 0 — run it in the
+                                 background and run it again after each message. Resumes
+                                 from your read cursor, so nothing sent between two waits
+                                 is missed. Exit 124 = --timeout passed with no mention.
+                                 Refuses to start when this session already has a live
+                                 listener.
+  bus listen <handle>            the streaming listener, for a Monitor that can stay
+                                 armed: prints every mention, never exits on its own
+                                 (same one-listener-per-session refusal)
+  bus listen-cmd <handle>        reprint the bus listen command
   bus leave [--force] <handle>   deregister (--force: also when the row belongs to
                                  another session — e.g. reclaiming a taken name)
   bus leave --by-session <id>    deregister whatever that Claude session joined as (used by the SessionEnd hook)
@@ -419,19 +611,7 @@ cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
   join)
     h="${1:-}"
-    # Handles live in log address fields, |-delimited roster rows, and lock/
-    # cursor FILENAMES — so an explicit handle is folded to lowercase (every
-    # matcher is case-insensitive anyway) and anything that would not survive
-    # all three verbatim is refused. Two distinct raw handles that slug to one
-    # filename would otherwise share a listener lock and hard-refuse each other.
-    if [ -n "$h" ]; then
-      h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"
-      case "$h" in
-        *[!a-z0-9_-]*)
-          echo "error: invalid handle '$1' — use letters, digits, '-' and '_' only." >&2
-          exit 1;;
-      esac
-    fi
+    if [ -n "$h" ]; then h="$(canon_handle "$h")" || exit 1; fi
     sid="${CLAUDE_CODE_SESSION_ID:-}"   # exported into every Bash tool call by Claude Code
     cpid="$(claude_pid)"                # owning Claude Code process, for the hard-kill reaper
     cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
@@ -456,13 +636,13 @@ case "$cmd" in
       echo "already joined as '$h' — this session is registered, nothing to do."
       lh="$(session_listener "$sid" "$cpid")"
       if [ "$(handle_slug "${lh:-}")" = "$(handle_slug "$h")" ] && [ -n "$lh" ]; then
-        echo "Your @$h listener is still running. Do NOT arm another Monitor."
+        echo "Your @$h listener is still running. Do NOT arm another listener."
       elif [ -n "$lh" ]; then
-        echo "This session's Monitor is still listening as @$lh — one Monitor per session."
-        echo "TaskStop that Monitor (and 'bus leave $lh' if renaming) before arming @$h."
+        echo "This session is still listening as @$lh — one listener per session."
+        echo "Stop that one (TaskStop its task, and 'bus leave $lh' if renaming) before arming @$h."
       else
-        echo "No live listener found for @$h. Arm one with this Monitor command (persistent):"
-        listen_cmd "$h"
+        echo "No live listener found for @$h. Arm your listener — $ARM_HOW:"
+        arm_cmd "$h"
       fi
       exit 0
     fi
@@ -501,7 +681,7 @@ case "$cmd" in
     # `catchup` shows nothing rather than the entire history. A cursor that
     # already exists is left strictly alone — that IS the unread gap, and this
     # is the moment we would otherwise destroy it.
-    cursor_get "$h" >/dev/null 2>&1 || cursor_set "$h" "$(log_size)"
+    cursor_get "$h" >/dev/null 2>&1 || cursor_set "$h" "$(log_boundary)"
     unlock
     # A re-join while this session's listener is still running (the classic
     # "did I already join?" moment) must not re-print the arm instruction —
@@ -511,78 +691,26 @@ case "$cmd" in
     # make `bus listen $h` refuse, so advising "arm it" would be a lie.
     lh="$(session_listener "$sid" "$cpid")"
     if [ "$(handle_slug "${lh:-}")" = "$(handle_slug "$h")" ] && [ -n "$lh" ]; then
-      echo "joined as '$h'. Your @$h listener is STILL RUNNING — do NOT arm another Monitor."
+      echo "joined as '$h'. Your @$h listener is STILL RUNNING — do NOT arm another listener."
     elif [ -n "$lh" ]; then
-      echo "joined as '$h', but this session's Monitor is still listening as @$lh — one Monitor per session."
-      echo "TaskStop that Monitor (and 'bus leave $lh' if renaming); then run 'bus join $h' again for the arm command."
+      echo "joined as '$h', but this session is still listening as @$lh — one listener per session."
+      echo "Stop that one (TaskStop its task, and 'bus leave $lh' if renaming); then run 'bus join $h' again for the arm command."
     else
-      echo "joined as '$h'. Arm your listener with this Monitor command (persistent):"
-      listen_cmd "$h"
+      echo "joined as '$h'. Arm your listener — $ARM_HOW:"
+      arm_cmd "$h"
     fi
     [ -n "$sid" ] || echo "note: CLAUDE_CODE_SESSION_ID is unset, so auto-leave on session end can't fire for '$h' — run 'bus leave $h' yourself." >&2
     ;;
   listen)
-    # The command a Monitor actually runs: the tail|bus-filter pipeline, wrapped
-    # in the duplicate-listener guard. The guard has to live HERE, at the moment
-    # the second pipeline would start — join can advise a forgetful session all
-    # it likes, but only the listener itself can make the duplicate fail instead
-    # of half-working (every message delivered twice, forever, silently).
-    h="${1:?usage: bus listen <handle>}"
-    h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')"   # same canonical form join enforces
-    case "$h" in
-      *[!a-z0-9_-]*)
-        echo "error: invalid handle '$1' — use letters, digits, '-' and '_' only." >&2
-        exit 1;;
-    esac
+    # The streaming listener: the tail|bus-filter pipeline, behind the
+    # duplicate-listener guard. It never exits on its own, so it suits a harness
+    # whose Monitor can stay armed; where Monitors are time-capped, `bus wait`
+    # is the listener to arm instead.
+    h="$(canon_handle "${1:?usage: bus listen <handle>}")" || exit 1
     lf="$(listener_file "$h")"
     sid="${CLAUDE_CODE_SESSION_ID:-}"
     cpid="$(claude_pid)"; cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
-    [ -n "$sid$cpid" ] || echo "warning: cannot attribute this listener to a session (no session id, no Claude process) — the one-Monitor-per-session rule cannot protect it." >&2
-    lock
-    # Clear the provably-dead first: stale locks (SIGKILLed listeners) and
-    # orphans (pipelines whose session's process is gone) — including orphans
-    # under OTHER handles, or a crashed session's pipeline would leak until
-    # someone happened to reuse its exact handle.
-    swept="$(listener_sweep)"
-    [ -n "$swept" ] && printf '%s\n' "$swept" | sed 's/^/note: /' >&2
-    # Then judge the survivors — all provably live, owner alive or unknown.
-    # Classify them ALL before refusing: the same-session verdict must win over
-    # the foreign-holder one, or which refusal (and which remedy) the user sees
-    # would depend on lock-filename collation order, and a session could be told
-    # to kill a healthy peer's listener instead of hearing about its own.
-    own_same=""; own_other=""; own_other_pid=""; foreign_pid=""
-    for f in "$LISTENERS"/*; do
-      [ -f "$f" ] || continue
-      # shellcheck disable=SC2034  # lk_h names the last field so read consumes it
-      IFS='|' read -r lk_pid lk_pstart lk_cpid lk_cstart lk_sid lk_h <"$f"
-      [ -n "${lk_h:-}" ] || lk_h="${f##*/}"
-      pid_alive "${lk_pid:-}" "${lk_pstart:-}" || continue
-      if same_session "${lk_sid:-}" "${lk_cpid:-}" "$sid" "$cpid"; then
-        if [ "$f" = "$lf" ]; then own_same="$lk_pid"; else own_other="$lk_h"; own_other_pid="$lk_pid"; fi
-      elif [ "$f" = "$lf" ]; then
-        foreign_pid="$lk_pid"
-      fi
-    done
-    if [ -n "$own_same" ]; then
-      unlock
-      echo "error: this session is ALREADY listening as @$h (pid $own_same)." >&2
-      echo "       Do NOT arm a second Monitor — the existing one is still delivering." >&2
-      exit 1
-    fi
-    if [ -n "$own_other" ]; then
-      unlock
-      echo "error: this session already has a live listener as @$own_other (pid $own_other_pid) — one Monitor per session." >&2
-      echo "       TaskStop that Monitor (and 'bus leave $own_other' if renaming) before listening as @$h." >&2
-      exit 1
-    fi
-    if [ -n "$foreign_pid" ]; then
-      unlock
-      echo "error: a live listener for @$h is already armed by a different session (pid $foreign_pid)." >&2
-      echo "       Two listeners on one handle deliver every message twice. If that listener is truly dead, kill pid $foreign_pid and retry." >&2
-      exit 1
-    fi
-    printf '%s|%s|%s|%s|%s|%s\n' "$$" "$(proc_start "$$")" "$cpid" "$cstart" "$sid" "$h" >"$lf"
-    unlock
+    listener_claim "$h" "$sid" "$cpid" "$cstart"
     # Both stages started separately across a FIFO so each has a pid the trap
     # can kill. A plain `tail | filter` pipeline hides tail's pid, and a tail
     # that outlives its consumer lingers until its next write dies on SIGPIPE.
@@ -590,12 +718,7 @@ case "$cmd" in
     rm -f "$fifo"
     mkfifo "$fifo" || { rm -f "$lf"; echo "error: could not create listener fifo" >&2; exit 1; }
     listen_cleanup() {
-      # Remove the lock only if it is still OURS: a listener being put down by
-      # a successor must not delete the fresh lock that successor just wrote.
-      if [ -f "$lf" ]; then
-        IFS='|' read -r _lc_pid _lc_rest <"$lf" 2>/dev/null
-        [ "${_lc_pid:-}" = "$$" ] && rm -f "$lf"
-      fi
+      listener_unclaim "$h"
       rm -f "$fifo"
       [ -n "${tail_pid:-}" ] && kill "$tail_pid" 2>/dev/null
       [ -n "${filter_pid:-}" ] && kill "$filter_pid" 2>/dev/null
@@ -609,6 +732,147 @@ case "$cmd" in
     tail -F -n 0 "$LOG" >"$fifo" & tail_pid=$!
     "$SELF_DIR/bus-filter" "$h" <"$fifo" & filter_pid=$!
     wait "$filter_pid"
+    ;;
+  wait)
+    # The listener a session arms: block until this handle is next tagged, print
+    # what arrived, mark it seen, exit 0. A session runs it as a background
+    # command — which, unlike a Monitor, has no time limit — and is re-invoked
+    # the moment it exits; it handles the message and arms the next wait.
+    #
+    # Delivery is exact across that gap because nothing here reads from "now":
+    # every wait starts at the handle's read cursor, the same one `catchup`
+    # advances, so a message that lands between two waits is simply the first
+    # thing the next one finds.
+    #
+    # A plain poll on the log's size, deliberately. There is no pipeline to
+    # manage, so there is nothing to orphan: `tail -F | filter` leaves both
+    # stages running when its parent is SIGKILLed, and a listener that is
+    # re-armed after every message would leak a pair each time that happened.
+    timeout=""; timeout_set=""; h=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --timeout)   [ $# -ge 2 ] || { echo "error: --timeout needs a number of seconds" >&2; exit 1; }
+                     timeout="$2"; timeout_set=1; shift 2;;
+        --timeout=*) timeout="${1#--timeout=}"; timeout_set=1; shift;;
+        -*)          echo "error: unknown option '$1' — usage: bus wait <handle> [--timeout <seconds>]" >&2; exit 1;;
+        *)           [ -z "$h" ] || { echo "error: one handle only — usage: bus wait <handle> [--timeout <seconds>]" >&2; exit 1; }
+                     h="$1"; shift;;
+      esac
+    done
+    [ -n "$h" ] || { echo "usage: bus wait <handle> [--timeout <seconds>]" >&2; exit 1; }
+    h="$(canon_handle "$h")" || exit 1
+    deadline=""
+    if [ -n "$timeout_set" ]; then
+      case "$timeout" in
+        ''|*[!0-9]*) echo "error: --timeout takes whole seconds, got '$timeout'" >&2; exit 1;;
+      esac
+      deadline=$(( SECONDS + 10#$timeout ))   # 10#: a leading zero is not octal
+    fi
+    # Seconds between looks at the log. Anything `sleep` would reject, or zero,
+    # falls back to the default: a sleep that returns at once turns this loop
+    # into a busy spin.
+    poll="${SESSION_BUS_WAIT_POLL:-2}"
+    case "$poll" in ''|*[!0-9.]*|*.*.*) poll=2;; esac
+    case "$poll" in *[1-9]*) ;; *) poll=2;; esac
+    sid="${CLAUDE_CODE_SESSION_ID:-}"
+    cpid="$(claude_pid)"; cstart=""; [ -n "$cpid" ] && cstart="$(proc_start "$cpid")"
+    refuse_foreign "$h" "$sid" "its mail is not this session's to take"
+    listener_claim "$h" "$sid" "$cpid" "$cstart"
+    sleep_pid=""
+    wait_cleanup() {
+      listener_unclaim "$h"
+      [ -n "${sleep_pid:-}" ] && kill "$sleep_pid" 2>/dev/null
+      return 0
+    }
+    trap wait_cleanup EXIT
+    # Say so on the way out: a wait that just vanishes with 143 looks like a
+    # glitch worth retrying, when it is usually somebody's decision — and a
+    # session that re-arms by reflex may no longer hold the handle.
+    trap 'echo "bus wait: stopped before any mention of @$h arrived (bus leave, a TaskStop, or the session ending). Nothing was marked seen. Check bus whoami before arming again." >&2; exit 143' INT TERM HUP
+    cf="$(cursor_file "$h")"
+    if [ ! -f "$cf" ]; then
+      # Never joined, so there is no last-seen position to resume from. Start
+      # at the end rather than replaying history, exactly as join seeds it.
+      off="$(log_boundary)"; cursor_set "$h" "$off"
+      echo "note: @$h has no read cursor yet — waiting for mentions from now on." >&2
+    else
+      off="$(cursor_get "$h" 2>/dev/null)" || off=""
+      case "${off:-}" in
+        ''|*[!0-9]*)
+          # A cursor that exists but cannot be read is not "no cursor": guessing
+          # the end would skip mail, guessing the start would replay the log.
+          echo "bus wait: @$h's read cursor ($cf) is unreadable — run 'bus catchup $h' to reset it, then arm again." >&2
+          exit 1;;
+      esac
+    fi
+    ticks=0; misses=0
+    while :; do
+      # A catchup run since the last look has already shown everything up to
+      # its cursor; pick that up rather than delivering the same lines again.
+      if IFS= read -r seen 2>/dev/null <"$cf"; then
+        case "${seen:-}" in ''|*[!0-9]*) ;; *) [ "$seen" -gt "$off" ] && off="$seen";; esac
+      fi
+      if size="$(wc -c 2>/dev/null <"$LOG")"; then
+        size=$(( size )); misses=0
+        # Shorter than the cursor: the log was truncated or replaced and the
+        # offset means nothing. Replay the lot rather than lose it (catchup's
+        # rule), and rewind the cursor so that happens exactly once.
+        if [ "$size" -lt "$off" ]; then off=0; cursor_rewind "$h" 0; fi
+        if [ "$size" -gt "$off" ]; then
+          end="$(whole_lines_end "$off" "$size")"
+          if [ "$end" -gt "$off" ]; then
+            if ! out="$(unseen_mentions "$h" "$off" "$end")"; then
+              echo "bus wait: could not filter the log ($SELF_DIR/bus-filter failed) — nothing was marked seen." >&2
+              exit 1
+            fi
+            if [ -n "$out" ]; then
+              # About to mark mail as seen — so be sure somebody is there to
+              # see it. A wait that outlived its session would otherwise eat
+              # the message: printed to nobody, and then hidden from the
+              # catchup of whoever takes the handle next.
+              if [ -n "$cpid" ] && ! pid_alive "$cpid" "$cstart"; then
+                echo "bus wait: the session that armed this (pid $cpid) is gone — leaving @$h's mail unread." >&2
+                exit 1
+              fi
+              # Print, THEN advance: if this dies in between, the message is
+              # shown twice rather than dropped once.
+              printf '%s\n' "$out" || exit 1
+              cursor_set "$h" "$end"
+              exit 0
+            fi
+            # Whole lines, none of them ours: step over them so they are not
+            # re-scanned on every look.
+            cursor_set "$h" "$end"; off="$end"
+          fi
+        fi
+      else
+        # One failed look is a blip (the log being replaced under us); a run of
+        # them is a listener that delivers nothing while everything reports it
+        # RUNNING. Say so and stop, so the session finds out.
+        misses=$(( misses + 1 ))
+        if [ "$misses" -ge 5 ]; then
+          echo "bus wait: cannot read $LOG — exiting rather than listen to nothing." >&2
+          exit 1
+        fi
+      fi
+      if [ -n "$deadline" ] && [ "$SECONDS" -ge "$deadline" ]; then
+        echo "bus wait: no mention of @$h in ${timeout}s." >&2
+        exit 124
+      fi
+      # Do not outlive the session: nobody is left to re-arm, and nothing else
+      # would stop this loop.
+      ticks=$(( ticks + 1 ))
+      if [ -n "$cpid" ] && [ $(( ticks % 15 )) -eq 0 ] && ! pid_alive "$cpid" "$cstart"; then
+        echo "bus wait: the session that armed this (pid $cpid) is gone — exiting." >&2
+        exit 1
+      fi
+      # Backgrounded so a TERM (e.g. `bus leave` putting this listener down) is
+      # acted on at once instead of after the sleep; its output is discarded so
+      # a straggler can never hold the caller's pipe open.
+      sleep "$poll" >/dev/null 2>&1 & sleep_pid=$!
+      wait "$sleep_pid" 2>/dev/null
+      sleep_pid=""
+    done
     ;;
   listen-cmd)
     listen_cmd "${1:?usage: bus listen-cmd <handle>}"
@@ -690,11 +954,12 @@ case "$cmd" in
       printf '@%s\n' "$h"
       printf '  matched by %s\n' "$via"
       if [ "$(handle_slug "${lh:-}")" = "$(handle_slug "$h")" ] && [ -n "$lh" ]; then
-        printf '  listener:  RUNNING — do NOT arm another Monitor\n'
+        printf '  listener:  RUNNING — do NOT arm another listener\n'
       elif [ -n "$lh" ]; then
-        printf '  listener:  none for @%s — this session is listening as @%s (one Monitor per session)\n' "$h" "$lh"
+        printf '  listener:  none for @%s — this session is listening as @%s (one listener per session)\n' "$h" "$lh"
       else
-        printf '  listen:    %s\n' "$(listen_cmd "$h")"   # $() strips listen_cmd's own newline
+        printf '  listener:  NOT RUNNING — %s:\n' "$ARM_HOW"
+        printf '             %s\n' "$(arm_cmd "$h")"   # $() strips arm_cmd's own newline
       fi
     done
     ;;
@@ -749,29 +1014,41 @@ case "$cmd" in
   catchup)
     h="${1:?usage: bus catchup <handle> [hours]}"
     hours="${2:-}"
-    size="$(log_size)"
+    refuse_foreign "$h" "${CLAUDE_CODE_SESSION_ID:-}" "catchup would mark its mail as seen ('bus log' reads without marking)"
+    # Cursor BEFORE size. A `bus wait` may be advancing the cursor right now;
+    # read the other way round, a cursor that moved past our older size
+    # snapshot would look like a truncated log and trigger a full replay.
+    off="$(cursor_get "$h" 2>/dev/null)" || off=""
+    case "${off:-}" in ''|*[!0-9]*) off="";; esac
+    size="$(log_boundary)"
+    mark="$size"   # how far this catchup has shown; the cursor mode narrows it
     if [ -n "$hours" ]; then
       out="$(window_catchup "$h" "$hours")"          # explicit window: an override, not the default
     else
-      off="$(cursor_get "$h" 2>/dev/null)" || off=""
-      case "${off:-}" in ''|*[!0-9]*) off="";; esac
       if [ -z "$off" ]; then
         # No cursor at all: a handle from before cursors existed, or one that
         # never joined. Fall back to the old window rather than dumping history.
         out="$(window_catchup "$h" 12)"
       else
-        # The cursor always lands on a line boundary (every writer sets it to a
-        # whole file size, and every log line ends in a newline). If it somehow
-        # exceeds the file, the log was truncated out from under us and the
-        # offset means nothing — replay the lot rather than lose it.
-        [ "$off" -gt "$size" ] && off=0
-        out="$(tail -c "+$((off+1))" "$LOG" 2>/dev/null | "$SELF_DIR/bus-filter" "$h")"
+        # A cursor past the end of the file means the log was truncated out
+        # from under us and the offset means nothing — replay the lot rather
+        # than lose it.
+        [ "$off" -gt "$size" ] && { off=0; cursor_rewind "$h" 0; }
+        # Exactly the bytes up to the size snapshot, whole lines only — the
+        # same window `bus wait` reads. Reading on to end-of-file instead would
+        # show a line appended after the snapshot and then leave the cursor
+        # short of it, and the next wait would deliver it a second time.
+        mark="$(whole_lines_end "$off" "$size")"
+        if ! out="$(unseen_mentions "$h" "$off" "$mark")"; then
+          echo "error: could not filter the log ($SELF_DIR/bus-filter failed) — nothing was marked seen." >&2
+          exit 1
+        fi
       fi
     fi
     # Deliberately uncapped. The old 40-line clip silently ate the overflow on a
     # busy day, which is precisely the failure a cursor exists to remove.
     if [ -n "$out" ]; then printf '%s\n' "$out"; else echo "(nothing new)"; fi
-    cursor_set "$h" "$size"
+    cursor_set "$h" "$mark"
     ;;
   log)
     tail -n "${1:-80}" "$LOG"

@@ -131,8 +131,14 @@ assert_not_contains "cursor drops other people's mail"    "$c" "not for alice"
 assert_not_contains "cursor drops pre-join history"       "$c" "before alice ever joined"
 assert_contains     "catchup advances the cursor"         "$("$BUS" catchup alice)" "(nothing new)"
 
-# A graceful leave marks the log read, so the next session sees the gap and
-# only the gap — the whole point of keying on leave rather than on a clock.
+# A graceful leave made while a streaming listener is running marks the log
+# read — that listener delivered it all live, without touching the cursor — so
+# the next session sees the gap and only the gap: the whole point of keying on
+# leave rather than on a clock.
+"$BUS" listen alice >/dev/null 2>&1 &
+STREAMER=$!
+LISTEN_PIDS="$LISTEN_PIDS $STREAMER"
+_i=0; while [ ! -s "$SESSION_BUS_DIR/listeners/alice" ] && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i+1)); done
 "$BUS" send bob @alice "seen live before leaving" >/dev/null
 "$BUS" leave alice >/dev/null
 "$BUS" send bob @alice "arrived while down" >/dev/null
@@ -141,6 +147,19 @@ g="$("$BUS" catchup alice)"
 assert_contains     "gap after graceful leave delivered"  "$g" "arrived while down"
 assert_not_contains "pre-leave traffic not re-delivered"  "$g" "seen live before leaving"
 assert_not_contains "rejoin does not reset an existing cursor" "$g" "first unread"
+# With NO streaming listener, nothing delivered that mail live, so a leave has
+# nothing to record. Marking the log read here is how a session that used
+# `bus wait` would lose whatever landed after its last wait exited.
+# The listener is stopped by hand first: the leave above only stops it when it
+# can tell the listener is its own, and a run with no session id and no Claude
+# process (CI) cannot — there it is still streaming, and still delivering.
+kill "$STREAMER" 2>/dev/null; wait "$STREAMER" 2>/dev/null
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "the streaming listener is down before the no-listener case" "lock survived"
+"$BUS" send bob @alice "landed with nothing listening" >/dev/null
+"$BUS" leave alice >/dev/null
+"$BUS" join alice >/dev/null 2>&1
+assert_contains "a leave with no streaming listener does not mark mail seen" \
+  "$("$BUS" catchup alice)" "landed with nothing listening"
 
 # The two failures the time window could not avoid.
 fresh
@@ -292,7 +311,7 @@ assert_contains "refusal says it is already listening"             "$out" "ALREA
 out="$(CLAUDE_CODE_SESSION_ID=SID-L "$BUS" listen beta 2>&1)"; rc=$?
 assert_eq       "same session, new handle: second monitor refused" "$rc" "1"
 assert_contains "refusal names the handle already held"            "$out" "@alice"
-assert_contains "refusal states the rule"                          "$out" "one Monitor per session"
+assert_contains "refusal states the rule"                          "$out" "one listener per session"
 out="$(CLAUDE_CODE_SESSION_ID=SID-M "$BUS" listen alice 2>&1)"; rc=$?
 assert_eq       "another session, same handle: refused"            "$rc" "1"
 assert_contains "cross-session refusal says whose it is"           "$out" "different session"
@@ -429,13 +448,13 @@ CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join gamma >/dev/null 2>&1
 spawn_listener SID-J gamma; LJ=$SPAWNED
 wait_lockfile gamma || fail "listener for the join tests armed" "no lock file appeared"
 out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join gamma 2>&1)"
-assert_contains     "re-join with a live listener warns instead"     "$out" "do NOT arm another Monitor"
+assert_contains     "re-join with a live listener warns instead"     "$out" "do NOT arm another listener"
 assert_not_contains "re-join with a live listener hides the arm cmd" "$out" "Arm your listener"
 out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join 2>&1)"
 assert_contains "bare re-join reports the existing handle"   "$out" "already joined as 'gamma'"
 assert_eq       "bare re-join mints no suffixed handle" "$(grep -c '^gamma' "$SESSION_BUS_DIR/roster")" "1"
 o="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" whoami 2>&1)"
-assert_contains "whoami shows the running listener"          "$o" "do NOT arm another Monitor"
+assert_contains "whoami shows the running listener"          "$o" "do NOT arm another listener"
 # ...and both ask the guard's own per-SESSION question: joining a second handle
 # while the @gamma Monitor runs must not hand out an arm command the guard is
 # guaranteed to refuse.
@@ -451,7 +470,275 @@ kill "$LJ" 2>/dev/null; wait "$LJ" 2>/dev/null
 out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join gamma 2>&1)"
 assert_contains "once the listener stops, join re-arms"      "$out" "Arm your listener"
 out="$(CLAUDE_CODE_SESSION_ID=SID-J "$BUS" join 2>&1)"
-assert_contains "bare re-join offers the arm cmd when not listening" "$out" "bus listen gamma"
+assert_contains "bare re-join offers the arm cmd when not listening" "$out" "bus wait gamma"
+
+# ---------------------------------------------------------------------------
+section "wait (the listener a session re-arms)"
+# `bus wait` exits on delivery, so most of this runs in the foreground with
+# --timeout 0 ("look once, never block"). The few that must block run in the
+# background with a fast poll and are reaped by the exit trap.
+export SESSION_BUS_WAIT_POLL=0.2
+W() { _w_sid="$1"; shift; CLAUDE_CODE_SESSION_ID="$_w_sid" "$BUS" wait "$@"; }   # <sid> <wait args...>
+spawn_waiter() { # <sid> <handle> <outfile> — sets SPAWNED; stderr lands in <outfile>.err
+  CLAUDE_CODE_SESSION_ID="$1" "$BUS" wait "$2" >"$3" 2>"$3.err" &
+  SPAWNED=$!
+  LISTEN_PIDS="$LISTEN_PIDS $SPAWNED"
+}
+wait_gone() { # <pid> [secs] — until the process has exited; rc 1 on timeout
+  _deadline=$(( $(date +%s) + ${2:-10} ))
+  while [ "$(date +%s)" -lt "$_deadline" ]; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+JOIN() { CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice >/dev/null 2>&1; CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join bob >/dev/null 2>&1; }
+C() { CLAUDE_CODE_SESSION_ID="${1:-SID-W}" "$BUS" catchup alice; }   # alice's catchup, as her session
+cursor_of() { cat "$SESSION_BUS_DIR/cursors/$1" 2>/dev/null; }
+log_bytes() { wc -c <"$SESSION_BUS_DIR/bus.log" | tr -d ' '; }
+
+# Mail that is already waiting is delivered at once, in the log's own format.
+fresh
+JOIN
+o="$(W SID-W alice --timeout 0 2>/dev/null)"; rc=$?
+assert_eq "nothing unseen + --timeout 0: exit 124"            "$rc" "124"
+assert_eq "a timeout prints nothing on stdout"                "$o" ""
+"$BUS" send bob @alice "sent before the wait" >/dev/null
+o="$(W SID-W alice --timeout 0)"; rc=$?
+assert_eq "an unseen mention: exit 0"                          "$rc" "0"
+assert_eq "printed exactly as the log (and bus listen) has it" "$o" "$(grep ':: sent before the wait' "$SESSION_BUS_DIR/bus.log")"
+assert_contains "delivery marks it seen: catchup has nothing"  "$(C)" "(nothing new)"
+W SID-W alice --timeout 0 >/dev/null 2>&1
+assert_eq "delivery marks it seen: the next wait does not repeat it" "$?" "124"
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "a finished wait releases its lock" "lock survived" \
+                                          || pass "a finished wait releases its lock"
+
+# The gap between two waits is where a "listen from now" design loses mail.
+"$BUS" send bob @alice "landed between two waits" >/dev/null
+"$BUS" send bob @all   "broadcast in the same gap" >/dev/null
+o="$(W SID-W alice --timeout 0)"
+assert_contains "a message sent between two waits is delivered by the next" "$o" "landed between two waits"
+assert_contains "everything unseen arrives in one exit, @all included"      "$o" "broadcast in the same gap"
+assert_eq       "one line per message"                                      "$(printf '%s\n' "$o" | wc -l | tr -d ' ')" "2"
+
+# Addressing is bus-filter's: other people's mail and your own sends wake nobody.
+"$BUS" send bob @carol "not for alice" >/dev/null
+"$BUS" send alice @all "alice talking" >/dev/null
+o="$(W SID-W alice --timeout 0 2>/dev/null)"; rc=$?
+assert_eq "untagged traffic and self-sends do not end the wait" "$rc" "124"
+assert_eq "…and print nothing"                                  "$o" ""
+assert_eq "the cursor steps over traffic that was not ours"     "$(cursor_of alice)" "$(log_bytes)"
+"$BUS" send bob @alice "$(printf 'line one\nline two')" >/dev/null
+assert_contains "a blob message keeps its retrieval hint"       "$(W SID-W alice --timeout 0)" "read it with: bus get"
+
+# A cursor only ever rests on a line boundary.
+fresh
+JOIN
+before="$(log_bytes)"   # the last line boundary: as far as any cursor may go
+printf '[bob 10-09 12:00] @alice :: half a li' >> "$SESSION_BUS_DIR/bus.log"
+o="$(W SID-W alice --timeout 0 2>/dev/null)"; rc=$?
+assert_eq "a line still being written is not delivered"     "$rc|$o" "124|"
+assert_contains "catchup does not show the half line either" "$(C)" "(nothing new)"
+assert_eq "…and neither steps the cursor into it"           "$(cursor_of alice)" "$before"
+printf 'ne, now whole\n' >> "$SESSION_BUS_DIR/bus.log"
+assert_contains "once whole, it is delivered whole"          "$(W SID-W alice --timeout 0)" ":: half a line, now whole"
+
+# A cursor past the end of the log means the log was truncated: replay, once.
+fresh
+JOIN
+"$BUS" send bob @alice "survived the truncation" >/dev/null
+printf '999999\n' > "$SESSION_BUS_DIR/cursors/alice"
+assert_contains "wait replays a truncated log"                "$(W SID-W alice --timeout 0)" "survived the truncation"
+W SID-W alice --timeout 0 >/dev/null 2>&1
+assert_eq       "…exactly once (the cursor is rewound)"       "$?" "124"
+printf '999999\n' > "$SESSION_BUS_DIR/cursors/alice"
+assert_contains "catchup replays a truncated log"             "$(C)" "survived the truncation"
+assert_contains "…exactly once (it used to replay forever)"   "$(C)" "(nothing new)"
+
+# A handle that never joined has no last-seen position: start from now.
+fresh
+"$BUS" send bob @dave "history from before dave existed" >/dev/null
+o="$(W SID-D dave --timeout 0 2>/dev/null)"; rc=$?
+assert_eq "no cursor: history is not replayed"            "$rc|$o" "124|"
+"$BUS" send bob @dave "after dave first waited" >/dev/null
+assert_contains "no cursor: later mail is still delivered" "$(W SID-D dave --timeout 0 2>/dev/null)" "after dave first waited"
+
+# Arguments.
+fresh
+W SID-W >/dev/null 2>&1;                      assert_eq "no handle -> rc 1"            "$?" "1"
+W SID-W 'bad name' >/dev/null 2>&1;           assert_eq "invalid handle -> rc 1"       "$?" "1"
+W SID-W alice --timeout soon >/dev/null 2>&1; assert_eq "non-numeric --timeout -> rc 1" "$?" "1"
+W SID-W alice --timeout >/dev/null 2>&1;      assert_eq "--timeout with no value -> rc 1" "$?" "1"
+W SID-W alice --frobnicate >/dev/null 2>&1;   assert_eq "unknown option -> rc 1"       "$?" "1"
+[ -z "$(ls "$SESSION_BUS_DIR/listeners" 2>/dev/null)" ] && pass "a refused wait leaves no lock behind" \
+  || fail "a refused wait leaves no lock behind" "$(ls "$SESSION_BUS_DIR/listeners")"
+CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice >/dev/null 2>&1
+W SID-W --timeout=08 alice >/dev/null 2>&1;   assert_eq "--timeout=N form, option first, leading zero is decimal" "$?" "124"
+assert_contains "join hands out the wait command to arm" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" join dave 2>&1)" "bus wait dave"
+assert_contains "whoami hands out the wait command to arm" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" whoami 2>&1)" "bus wait dave"
+
+# Blocking: a wait armed BEFORE the message, woken by it.
+fresh
+JOIN
+OUT="$SESSION_BUS_DIR/alice.out"
+spawn_waiter SID-W alice "$OUT"; W1=$SPAWNED
+wait_lockfile alice && pass "an armed wait holds the handle's listener lock" \
+  || fail "an armed wait holds the handle's listener lock" "no lock file appeared"
+# One live listener per session, whichever kind it is.
+out="$(W SID-W alice 2>&1)"; rc=$?
+assert_eq       "a second wait while one is armed: refused"  "$rc" "1"
+assert_contains "the refusal says it is already listening"   "$out" "ALREADY listening as @alice"
+out="$(CLAUDE_CODE_SESSION_ID=SID-W "$BUS" listen alice 2>&1)"; rc=$?
+assert_eq       "bus listen while a wait is armed: refused"  "$rc" "1"
+out="$(W SID-W beta 2>&1)"; rc=$?
+assert_eq       "a wait under a second handle: refused"      "$rc" "1"
+assert_contains "the refusal states the rule"                "$out" "one listener per session"
+out="$(W SID-X alice 2>&1)"; rc=$?
+assert_eq       "another session waiting on the same handle: refused" "$rc" "1"
+assert_contains "…because the handle is not its to read"              "$out" "registered to a different session"
+assert_contains "join sees the armed wait and withholds the arm command" \
+  "$(CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice 2>&1)" "STILL RUNNING"
+kill -0 "$W1" 2>/dev/null && pass "the armed wait is still blocking through all of that" \
+  || fail "the armed wait is still blocking through all of that" "it exited: $(cat "$OUT.err")"
+"$BUS" send bob @alice "woke the armed wait" >/dev/null
+wait_gone "$W1" && pass "a mention ends the wait" || fail "a mention ends the wait" "still running after 10s"
+wait "$W1" 2>/dev/null
+assert_eq       "the woken wait exits 0"               "$?" "0"
+assert_contains "the woken wait printed the message"   "$(cat "$OUT")" "woke the armed wait"
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "the woken wait released its lock" "lock survived" \
+                                          || pass "the woken wait released its lock"
+# The slot is free again the moment it exits — the re-arm must never be refused.
+spawn_waiter SID-W alice "$OUT.2"; W2=$SPAWNED
+wait_lockfile alice && pass "a later wait arms cleanly after the first exits" \
+  || fail "a later wait arms cleanly after the first exits" "$(cat "$OUT.2.err")"
+# `bus leave` puts the armed wait down, like any listener.
+CLAUDE_CODE_SESSION_ID=SID-W "$BUS" leave alice >/dev/null 2>&1
+wait_gone "$W2" && pass "leave stops the armed wait" || fail "leave stops the armed wait" "still running after 10s"
+wait "$W2" 2>/dev/null
+assert_eq "a wait that was stopped exits non-zero (143), never 0" "$?" "143"
+assert_eq "…having printed nothing"                               "$(cat "$OUT.2")" ""
+assert_contains "…and says it was stopped, not that it failed"    "$(cat "$OUT.2.err")" "stopped before any mention"
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "a stopped wait releases its lock" "lock survived" \
+                                          || pass "a stopped wait releases its lock"
+# A lock left by a SIGKILLed wait never blocks its successor.
+CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice >/dev/null 2>&1
+printf '%s|Mon Jan  1 00:00:00 2001|||SID-DEAD|alice\n' "$(dead_pid2)" > "$SESSION_BUS_DIR/listeners/alice"
+W SID-W alice --timeout 0 >/dev/null 2>&1
+assert_eq "a stale lock does not block a wait" "$?" "124"
+
+# A wait must not outlive the session that armed it — and above all must not
+# mark mail seen on that session's behalf. The owner here is a real process the
+# bus recognises as Claude Code (it matches on the name), so it can be killed.
+FAKEBIN="$(mktemp -d "$TMP_ROOT/bin.XXXXXX")"
+ln -s "$(command -v bash)" "$FAKEBIN/claude"
+spawn_owned_waiter() { # <outfile> — sets OWNER (the fake Claude) and reads the wait's pid into WPID
+  # shellcheck disable=SC2016  # expanded by the fake Claude process, not here
+  CLAUDE_CODE_SESSION_ID=SID-O "$FAKEBIN/claude" -c \
+    '"$1" wait alice >"$2" 2>"$2.err" & echo $! >"$2.pid"; wait' _ "$BUS" "$1" >/dev/null 2>&1 &
+  OWNER=$!
+  LISTEN_PIDS="$LISTEN_PIDS $OWNER"
+  wait_lockfile alice || return 1
+  WPID="$(cat "$1.pid" 2>/dev/null)"
+  LISTEN_PIDS="$LISTEN_PIDS $WPID"
+  [ -n "$WPID" ]
+}
+fresh
+CLAUDE_CODE_SESSION_ID=SID-O "$BUS" join alice >/dev/null 2>&1; CLAUDE_CODE_SESSION_ID=SID-B "$BUS" join bob >/dev/null 2>&1
+OUT="$SESSION_BUS_DIR/orphan.out"
+spawn_owned_waiter "$OUT" || fail "owned wait armed" "no lock or pid: $(cat "$OUT.err" 2>/dev/null)"
+assert_match "the wait records its owning Claude process" "$(cat "$SESSION_BUS_DIR/listeners/alice")" "^$WPID\\|[^|]+\\|$OWNER\\|"
+kill -9 "$OWNER" 2>/dev/null; wait "$OWNER" 2>/dev/null
+"$BUS" send bob @alice "arrived after the session died" >/dev/null
+wait_gone "$WPID" && pass "an orphaned wait exits rather than deliver to nobody" \
+  || fail "an orphaned wait exits rather than deliver to nobody" "still running after 10s"
+assert_eq       "the orphan printed nothing"                  "$(cat "$OUT")" ""
+assert_contains "…and said why"                               "$(cat "$OUT.err")" "is gone"
+assert_contains "the mail it declined is still unseen for the handle's next session" \
+  "$(C SID-O)" "arrived after the session died"
+# …and with no mail at all, it still notices and stops on its own.
+spawn_owned_waiter "$OUT.2" || fail "second owned wait armed" "no lock or pid: $(cat "$OUT.2.err" 2>/dev/null)"
+kill -9 "$OWNER" 2>/dev/null; wait "$OWNER" 2>/dev/null
+wait_gone "$WPID" 15 && pass "an idle orphaned wait stops polling on its own" \
+  || fail "an idle orphaned wait stops polling on its own" "still running after 15s"
+[ -f "$SESSION_BUS_DIR/listeners/alice" ] && fail "the orphan released its lock" "lock survived" \
+                                          || pass "the orphan released its lock"
+
+# ---------------------------------------------------------------------------
+
+# --- what the read cursor is protected from ---------------------------------
+# A leave between two waits: the session ends while mail it was never shown is
+# sitting in the log. Both the hand-typed leave and the SessionEnd hook's form.
+for how in plain by-session; do
+  fresh; JOIN
+  "$BUS" send bob @alice "delivered by the first wait" >/dev/null
+  W SID-W alice --timeout 0 >/dev/null 2>&1
+  "$BUS" send bob @alice "landed after the wait exited" >/dev/null
+  if [ "$how" = plain ]; then CLAUDE_CODE_SESSION_ID=SID-W "$BUS" leave alice >/dev/null 2>&1
+  else "$BUS" leave --by-session SID-W >/dev/null 2>&1; fi
+  CLAUDE_CODE_SESSION_ID=SID-NEXT "$BUS" join alice >/dev/null 2>&1
+  c="$(C SID-NEXT)"
+  assert_contains     "leave ($how) between two waits does not eat unseen mail" "$c" "landed after the wait exited"
+  assert_not_contains "…and what a wait did deliver stays delivered"            "$c" "delivered by the first wait"
+done
+
+# Another session: a handle's mail is read only by the session that holds it.
+fresh; JOIN
+"$BUS" send bob @alice "for the holder only" >/dev/null
+out="$(W SID-INTRUDER alice --timeout 0 2>&1)"; rc=$?
+assert_eq       "wait on a handle another session holds: refused" "$rc" "1"
+assert_contains "the refusal says whose it is"                    "$out" "registered to a different session (SID-W)"
+out="$(C SID-INTRUDER 2>&1)"; rc=$?
+assert_eq       "catchup on a handle another session holds: refused" "$rc" "1"
+assert_not_contains "the refused catchup showed none of it"          "$out" "for the holder only"
+assert_contains "the holder still gets its mail" "$(W SID-W alice --timeout 0)" "for the holder only"
+assert_contains "a plain shell (no session id) may still catchup by hand" \
+  "$(env -u CLAUDE_CODE_SESSION_ID "$BUS" catchup alice)" "(nothing new)"
+
+# A filter that cannot run prints nothing — exactly like a filter that matched
+# nothing. The cursor must only move for the second.
+fresh; JOIN
+LONE="$(mktemp -d "$TMP_ROOT/lone.XXXXXX")"; cp "$BUS" "$LONE/bus"   # a bus with no bus-filter beside it
+"$BUS" send bob @alice "must survive a broken filter" >/dev/null
+before="$(cursor_of alice)"
+CLAUDE_CODE_SESSION_ID=SID-W "$LONE/bus" wait alice --timeout 0 >/dev/null 2>&1
+assert_eq "wait with a broken filter: exit 1 (not 'nothing arrived')" "$?" "1"
+CLAUDE_CODE_SESSION_ID=SID-W "$LONE/bus" catchup alice >/dev/null 2>&1
+assert_eq "catchup with a broken filter: exit 1"                      "$?" "1"
+assert_eq "neither marked the mail seen"                              "$(cursor_of alice)" "$before"
+assert_contains "the mail is still there for a working wait" "$(W SID-W alice --timeout 0)" "must survive a broken filter"
+
+# A cursor that exists but cannot be read is not "no cursor".
+: > "$SESSION_BUS_DIR/cursors/alice"
+out="$(W SID-W alice --timeout 0 2>&1)"; rc=$?
+assert_eq       "unreadable cursor: wait refuses to guess" "$rc" "1"
+assert_contains "…and names the way out"                    "$out" "bus catchup alice"
+C >/dev/null 2>&1
+W SID-W alice --timeout 0 >/dev/null 2>&1
+assert_eq       "catchup resets it and wait works again"    "$?" "124"
+
+# Every cursor write lands on a line boundary, the first-wait seed included.
+fresh
+LOGF "[bob 10-09 12:00] @all :: a whole line"
+boundary="$(log_bytes)"
+printf '[bob 10-09 12:01] @carol :: half a li' >> "$SESSION_BUS_DIR/bus.log"
+W SID-C carol --timeout 0 >/dev/null 2>&1
+assert_eq "a first wait seeds its cursor at the last whole line" "$(cursor_of carol)" "$boundary"
+printf 'ne\n' >> "$SESSION_BUS_DIR/bus.log"
+assert_contains "…so the line being written then is not lost" "$(W SID-C carol --timeout 0 2>/dev/null)" "half a line"
+
+# A wait that can no longer read the log says so and stops; it does not sit
+# there reporting RUNNING while delivering nothing.
+fresh; JOIN
+OUT="$SESSION_BUS_DIR/../deaf.$$.out"
+spawn_waiter SID-W alice "$OUT"; WD=$SPAWNED
+wait_lockfile alice || fail "wait for the unreadable-log test armed" "no lock file appeared"
+rm -f "$SESSION_BUS_DIR/bus.log"
+wait_gone "$WD" && pass "a wait that cannot read the log exits" || fail "a wait that cannot read the log exits" "still running after 10s"
+wait "$WD" 2>/dev/null
+assert_eq       "…with exit 1"   "$?" "1"
+assert_contains "…and says why"  "$(cat "$OUT.err")" "cannot read"
 
 # ---------------------------------------------------------------------------
 section "help"
@@ -533,7 +820,7 @@ CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice >/dev/null 2>&1
 o="$(CLAUDE_CODE_SESSION_ID=SID-W "$BUS" whoami 2>&1)"
 assert_contains "reports this session's handle" "$o" "@alice"
 assert_contains "says how it matched"           "$o" "matched by session id"
-assert_contains "reprints the listen command"   "$o" "bus listen alice"
+assert_contains "reprints the arm command"      "$o" "bus wait alice"
 # A sibling session in the same repo must resolve to itself, not its neighbour —
 # the reason whoami keys on session id rather than cwd in the first place.
 CLAUDE_CODE_SESSION_ID=SID-V "$BUS" join alice2 >/dev/null 2>&1
