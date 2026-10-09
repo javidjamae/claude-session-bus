@@ -809,6 +809,13 @@ assert_contains "version-pr.yml passes pr-title"        "$vpr_with" "pr-title:"
 # the tag. Asserted so a future bump cannot quietly re-enable them.
 assert_contains "version-pr.yml never creates GitHub releases" "$(cat "$VPR")" "create-github-releases: false"
 assert_contains "version-pr.yml never pushes git tags"         "$(cat "$VPR")" "push-git-tags: false"
+# The action's default commits through the GitHub API, which rejects executable
+# files — and the version bump always rewrites `bus`. It failed on the first
+# release that had a changeset to consume; a no-op run never gets that far.
+assert_contains "version-pr.yml commits with git (the API path rejects executable files)" \
+  "$vpr_with" "push-with-git-cli: true"
+assert_eq "…and bus is still the executable that makes that necessary" \
+  "$(git -C "$REPO" ls-files -s bus | cut -c1-6)" "100755"
 
 # ---------------------------------------------------------------------------
 section "whoami"
