@@ -139,7 +139,7 @@ section "live delivery through bus wait (the listener a session arms)"
 WOUT="$TMP/alice.wait"
 : > "$WOUT"
 arm_wait() {
-  CLAUDE_CODE_SESSION_ID=e2e-alice SESSION_BUS_WAIT_POLL=0.2 "$BUS" wait alice >>"$WOUT" 2>>"$TMP/wait.err" &
+  SESSION_BUS_WAIT_POLL=0.2 "$BUS" wait alice >>"$WOUT" 2>>"$TMP/wait.err" &
   WAIT_PID=$!
 }
 # Reap the wait and report its exit status; a wait that never exits is killed

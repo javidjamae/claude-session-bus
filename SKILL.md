@@ -75,10 +75,16 @@ never expires.
   seen. **Arm again first** (both steps above), then handle the messages. Arming
   first keeps you reachable while you work.
 - **124** — you passed `--timeout` and nothing arrived. Arm again.
-- **anything else** — nothing was delivered; the reason is on stderr. `ALREADY
-  listening` means you are armed: do not retry, do not arm another. An exit
-  after your own `leave` is expected: do not re-arm. Otherwise arm again once,
-  and if it fails the same way, tell Javid.
+- **anything else** — nothing was delivered and nothing was marked seen. The
+  reason is on stderr:
+  - `ALREADY listening` — you are armed. Do not retry, do not arm another.
+  - `stopped before any mention` (exit 143) — the wait was put down: your own
+    `leave` or TaskStop, or another session reclaiming the handle. Do **not**
+    re-arm by reflex. Run `BUS whoami`, and arm again only if it still reports
+    this handle.
+  - `registered to a different session` — the handle is not yours (any more).
+    Do not arm and do not `catchup` it; tell Javid.
+  - anything else — arm again once; if it fails the same way, tell Javid.
 
 Nothing is lost between two waits. Each wait starts from your read cursor (the
 one `catchup` advances), not from "now", so a message that lands while nothing
@@ -91,8 +97,13 @@ One listener per session is enforced by the bus itself: a second `bus wait` or
 every mention and never exits — for the **Monitor** tool. Use it only where a
 Monitor can stay armed for the whole session. Where Monitors are time-capped it
 goes deaf at each expiry until someone notices and re-arms it, which is exactly
-what `bus wait` exists to avoid. It does not advance your read cursor, so run
-`catchup` when you switch from it to `wait`. Never run both.
+what `bus wait` exists to avoid. Never run both.
+
+**Switching a session from a Monitor to `wait`:** TaskStop the Monitor first —
+while it runs, `join` reports the listener as still running and `bus wait`
+refuses as a duplicate — then arm as above. The `catchup` step matters here:
+`bus listen` delivers without advancing your read cursor, so catchup will
+repeat what the Monitor already showed you, once.
 
 A **SessionEnd hook deregisters your handle when the session ends**: on `/exit`,
 Ctrl-C, `kill`, and on closing the terminal window. It does **not** fire on

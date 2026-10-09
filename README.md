@@ -255,7 +255,7 @@ it once — the same bias as everywhere else here.
 | --- | --- |
 | `0` | mentions were printed and marked seen |
 | `124` | `--timeout <seconds>` passed with nothing to show (`--timeout 0` looks once and never blocks) |
-| anything else | nothing was delivered and nothing was marked seen — refused as a duplicate, stopped by `bus leave` or a TaskStop (`143`), or orphaned |
+| anything else | nothing was delivered and nothing was marked seen; stderr says why — refused (a duplicate listener, or a handle another session holds), stopped by `bus leave` or a TaskStop (`143`), orphaned, or unable to read the log |
 
 A few deliberate choices:
 
@@ -274,8 +274,9 @@ A few deliberate choices:
 
 `bus listen <handle>` remains as the streaming form — every mention, never
 exiting — for a harness whose Monitor can stay armed for the whole session. It
-delivers without touching the read cursor, so run `bus catchup` when moving from
-it to `bus wait`.
+delivers without touching the read cursor. To move a session from it to
+`bus wait`, stop the Monitor first (the one-listener guard refuses the wait
+while it runs), then `bus catchup` and arm the wait.
 
 ## Catchup is a cursor, not a clock
 
@@ -289,11 +290,19 @@ Three things advance the cursor:
 - **`catchup` itself**, once it has shown you the messages.
 - **`bus wait`**, once it has printed them. It reads from the cursor rather than
   from "now", which is what makes re-arming it lossless.
-- **A graceful leave.** Your listener is armed right up to the moment your session
-  ends, so everything logged before that was delivered live. The gap starts
-  exactly there, which is why the cursor is keyed on your session ending rather
-  than on a clock — a window can only guess at that boundary, and guesses wrong
-  in both directions.
+- **A graceful leave, while a streaming `bus listen` is running.** That listener
+  delivers live without touching the cursor and is armed right up to the moment
+  your session ends, so everything logged before that was delivered. The gap
+  starts exactly there, which is why the cursor is keyed on your session ending
+  rather than on a clock — a window can only guess at that boundary, and guesses
+  wrong in both directions. A leave with no streaming listener leaves the cursor
+  alone: `bus wait` has already moved it past everything it delivered, and
+  whatever landed after the last wait exited has been shown to nobody.
+
+Reading a handle's mail moves its cursor, so `catchup` and `bus wait` are only
+for the session that holds the handle: run from a session the roster says is a
+different one, both refuse (`bus log` reads everything without marking
+anything). A call with no session id — you, in a terminal — is never refused.
 
 `prune` deliberately does *not* advance it when it reaps a `SIGKILL`ed session:
 nothing recorded when that session stopped reading, so its successor re-sees some
@@ -347,8 +356,10 @@ and second-handle listeners refused, stale locks ignored, orphans replaced and
 killed, a graceful stop releasing its slot, and `join`/`whoami` reporting a
 running listener instead of re-printing the arm command), `bus wait` (mail
 already waiting, mail sent between two waits, a half-written line, a truncated
-log, `--timeout`, the shared guard, `leave` stopping it, and an orphaned wait
-declining to mark mail seen), the `SessionEnd` hook, and the `install.sh` settings.json
+log, `--timeout`, the shared guard, `leave` stopping it without marking unseen
+mail seen, a handle held by another session, a filter that cannot run, an
+unreadable log, and an orphaned wait declining to mark mail seen), the
+`SessionEnd` hook, and the `install.sh` settings.json
 merge — which runs against a throwaway `$HOME`, so your real settings are never
 touched either.
 
