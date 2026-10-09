@@ -38,5 +38,13 @@ jobs:
           # automated tag on a build nobody authorized.
           create-github-releases: false
           push-git-tags: false
+          # Commit the version bump with git, not through the GitHub API (the
+          # v2 default). The API path refuses any executable file outright —
+          # "Unexpected executable file at bus" — and `bus` is exactly what
+          # scripts/sync-version rewrites, so with the default this job fails
+          # on every release that has a changeset to consume. A run with
+          # nothing to consume never reaches the commit, which is how it
+          # stayed green until the first real one.
+          push-with-git-cli: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
