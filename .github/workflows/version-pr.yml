@@ -7,7 +7,7 @@ name: version-pr
 # Nothing is ever published to npm.
 on:
   push:
-    branches: [main]
+    branches: [main, probe/version-pr-git-cli]   # PROBE ONLY: never merge this branch
 
 jobs:
   version:
