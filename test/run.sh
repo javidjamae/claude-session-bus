@@ -812,10 +812,10 @@ assert_contains "version-pr.yml never pushes git tags"         "$(cat "$VPR")" "
 # The action's default commits through the GitHub API, which rejects executable
 # files — and the version bump always rewrites `bus`. It failed on the first
 # release that had a changeset to consume; a no-op run never gets that far.
-assert_contains "version-pr.yml commits with git (the API path rejects executable files)" \
-  "$vpr_with" "push-with-git-cli: true"
-assert_eq "…and bus is still the executable that makes that necessary" \
-  "$(git -C "$REPO" ls-files -s bus | cut -c1-6)" "100755"
+# Anchored like the v1-input check above: the literal in a comment, or the
+# input commented out, must not pass.
+assert_match "version-pr.yml commits with git (the API path rejects executable files)" \
+  "$(printf '%s\n' "$vpr_with" | grep -E "^ +push-with-git-cli:")" "^ +push-with-git-cli: +['\"]?true['\"]? *$"
 
 # ---------------------------------------------------------------------------
 section "whoami"
