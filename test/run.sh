@@ -551,11 +551,11 @@ assert_contains "…exactly once (it used to replay forever)"   "$(C)" "(nothing
 
 # A handle that never joined has no last-seen position: start from now.
 fresh
-"$BUS" send bob @zed "history from before zed existed" >/dev/null
-o="$(W SID-Z zed --timeout 0 2>/dev/null)"; rc=$?
+"$BUS" send bob @dave "history from before dave existed" >/dev/null
+o="$(W SID-D dave --timeout 0 2>/dev/null)"; rc=$?
 assert_eq "no cursor: history is not replayed"            "$rc|$o" "124|"
-"$BUS" send bob @zed "after zed first waited" >/dev/null
-assert_contains "no cursor: later mail is still delivered" "$(W SID-Z zed --timeout 0 2>/dev/null)" "after zed first waited"
+"$BUS" send bob @dave "after dave first waited" >/dev/null
+assert_contains "no cursor: later mail is still delivered" "$(W SID-D dave --timeout 0 2>/dev/null)" "after dave first waited"
 
 # Arguments.
 fresh
@@ -569,9 +569,9 @@ W SID-W alice --frobnicate >/dev/null 2>&1;   assert_eq "unknown option -> rc 1"
 CLAUDE_CODE_SESSION_ID=SID-W "$BUS" join alice >/dev/null 2>&1
 W SID-W --timeout=08 alice >/dev/null 2>&1;   assert_eq "--timeout=N form, option first, leading zero is decimal" "$?" "124"
 assert_contains "join hands out the wait command to arm" \
-  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" join arm 2>&1)" "bus wait arm"
+  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" join dave 2>&1)" "bus wait dave"
 assert_contains "whoami hands out the wait command to arm" \
-  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" whoami 2>&1)" "bus wait arm"
+  "$(CLAUDE_CODE_SESSION_ID=SID-A "$BUS" whoami 2>&1)" "bus wait dave"
 
 # Blocking: a wait armed BEFORE the message, woken by it.
 fresh
@@ -716,11 +716,11 @@ assert_eq       "catchup resets it and wait works again"    "$?" "124"
 fresh
 LOGF "[bob 10-09 12:00] @all :: a whole line"
 boundary="$(log_bytes)"
-printf '[bob 10-09 12:01] @yan :: half a li' >> "$SESSION_BUS_DIR/bus.log"
-W SID-Y yan --timeout 0 >/dev/null 2>&1
-assert_eq "a first wait seeds its cursor at the last whole line" "$(cursor_of yan)" "$boundary"
+printf '[bob 10-09 12:01] @carol :: half a li' >> "$SESSION_BUS_DIR/bus.log"
+W SID-C carol --timeout 0 >/dev/null 2>&1
+assert_eq "a first wait seeds its cursor at the last whole line" "$(cursor_of carol)" "$boundary"
 printf 'ne\n' >> "$SESSION_BUS_DIR/bus.log"
-assert_contains "…so the line being written then is not lost" "$(W SID-Y yan --timeout 0 2>/dev/null)" "half a line"
+assert_contains "…so the line being written then is not lost" "$(W SID-C carol --timeout 0 2>/dev/null)" "half a line"
 
 # A wait that can no longer read the log says so and stops; it does not sit
 # there reporting RUNNING while delivering nothing.
